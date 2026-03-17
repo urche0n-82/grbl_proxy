@@ -26,7 +26,7 @@ A Raspberry Pi-based proxy that sits between [LightBurn](https://lightburnsoftwa
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-repo/grbl-proxy.git ~/grbl-proxy
+git clone https://github.com/urche0n-82/grbl_proxy.git ~/grbl-proxy
 cd ~/grbl-proxy
 ```
 
