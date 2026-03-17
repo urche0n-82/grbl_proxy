@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "grbl-proxy"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "pyserial>=3.5",
+    "PyYAML>=6.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+grbl-proxy = "grbl_proxy.main:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/grbl_proxy"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

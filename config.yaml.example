@@ -1,0 +1,32 @@
+# GRBL Proxy configuration
+# Copy to ~/.grbl-proxy/config.yaml and edit as needed.
+
+serial:
+  port: auto              # auto-detect, or explicit path e.g. /dev/ttyUSB0
+  baud: 115200
+  dtr: false              # CRITICAL: false prevents ESP32-S2 reset on connect
+  reconnect_interval: 5   # seconds between reconnection attempts
+
+tcp:
+  host: 0.0.0.0
+  port: 8899              # use 23 for LightBurn default (requires root or setcap)
+
+web:
+  host: 0.0.0.0
+  port: 8080
+
+job:
+  storage_dir: ~/.grbl-proxy/jobs
+  max_history: 20
+  start_marker: "; PROXY_JOB_START"
+  end_marker: "; PROXY_JOB_END"
+  auto_detect:
+    enabled: true
+    line_burst: 10
+    window_ms: 500
+    motion_ratio: 0.8
+
+machine:
+  name: "Falcon 2 Pro"
+  work_area: [400, 415]   # mm
+  status_poll_hz: 4

@@ -1,0 +1,178 @@
+"""Serial port management for grbl-proxy.
+
+Uses pyserial (blocking) wrapped in asyncio.to_thread() so the asyncio event
+loop is never blocked. Do NOT use serial_asyncio — it is poorly maintained and
+fragile on Raspberry Pi.
+
+Critical: DTR and RTS must be disabled to prevent the ESP32-S2 from resetting
+every time the serial port is opened.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+import serial
+import serial.tools.list_ports
+
+from grbl_proxy.config import SerialConfig
+
+logger = logging.getLogger(__name__)
+
+READLINE_TIMEOUT = 1.0  # seconds — allows reconnection detection loop to tick
+
+
+class SerialDisconnectedError(OSError):
+    """Raised by read_line() / write() when the serial device is not available."""
+
+
+class SerialConnection:
+    """Async wrapper around a pyserial Serial object.
+
+    All blocking pyserial calls are dispatched to a thread via asyncio.to_thread().
+    There is never more than one concurrent read in flight (the serial-to-TCP relay
+    loop owns the read path). Writes are protected by an asyncio.Lock.
+    """
+
+    def __init__(self, config: SerialConfig, port: str | None = None):
+        self._config = config
+        self._port = port or config.port
+        self._serial: serial.Serial | None = None
+        self._write_lock = asyncio.Lock()
+        self._connected = asyncio.Event()
+        self._shutting_down = False
+
+    # ------------------------------------------------------------------
+    # Public interface (same as MockSerialConnection for duck-typing)
+    # ------------------------------------------------------------------
+
+    async def connect(self) -> None:
+        """Open the serial port. Raises SerialDisconnectedError on failure."""
+        await asyncio.to_thread(self._open_port)
+
+    async def disconnect(self) -> None:
+        """Close the serial port cleanly."""
+        self._shutting_down = True
+        self._connected.clear()
+        s = self._serial
+        self._serial = None
+        if s is not None:
+            await asyncio.to_thread(s.close)
+
+    async def read_line(self) -> str:
+        """Read one newline-terminated line from the serial port.
+
+        Blocks (in a thread) until a complete line arrives or the 1-second
+        readline timeout fires. On timeout returns an empty string. On USB
+        disconnect raises SerialDisconnectedError.
+        """
+        if self._serial is None:
+            raise SerialDisconnectedError("Serial port not open")
+
+        try:
+            raw = await asyncio.to_thread(self._serial.readline)
+        except serial.SerialException as e:
+            logger.warning("Serial read error: %s", e)
+            self._connected.clear()
+            raise SerialDisconnectedError(str(e)) from e
+        except OSError as e:
+            logger.warning("Serial OS error on read: %s", e)
+            self._connected.clear()
+            raise SerialDisconnectedError(str(e)) from e
+
+        if not raw:
+            # Timeout — no data within READLINE_TIMEOUT seconds, not an error
+            return ""
+
+        return raw.decode(errors="replace").rstrip("\r\n")
+
+    async def write(self, data: bytes) -> None:
+        """Write bytes to the serial port.
+
+        Uses a lock to prevent concurrent writes from the TCP relay task and
+        any future polling task. Raises SerialDisconnectedError on failure.
+        """
+        if self._serial is None:
+            raise SerialDisconnectedError("Serial port not open")
+
+        async with self._write_lock:
+            try:
+                await asyncio.to_thread(self._serial.write, data)
+            except serial.SerialException as e:
+                logger.warning("Serial write error: %s", e)
+                self._connected.clear()
+                raise SerialDisconnectedError(str(e)) from e
+            except OSError as e:
+                logger.warning("Serial OS error on write: %s", e)
+                self._connected.clear()
+                raise SerialDisconnectedError(str(e)) from e
+
+    async def run_reconnect_loop(self) -> None:
+        """Background task: detect disconnection and reconnect automatically.
+
+        Run this as an asyncio.Task alongside the rest of the proxy. It monitors
+        the connection state and retries every config.reconnect_interval seconds
+        when the port is unavailable.
+        """
+        while not self._shutting_down:
+            if not self._connected.is_set():
+                logger.info(
+                    "Attempting serial reconnect to %s ...", self._port
+                )
+                try:
+                    await asyncio.to_thread(self._open_port)
+                    logger.info("Serial reconnected to %s", self._port)
+                except SerialDisconnectedError:
+                    pass  # will retry after interval
+
+            await asyncio.sleep(self._config.reconnect_interval)
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected.is_set()
+
+    @property
+    def port(self) -> str:
+        return self._port
+
+    # ------------------------------------------------------------------
+    # Internal helpers (run in threads via asyncio.to_thread)
+    # ------------------------------------------------------------------
+
+    def _open_port(self) -> None:
+        """Blocking: open the serial port. Sets _connected on success."""
+        if self._serial is not None:
+            try:
+                self._serial.close()
+            except Exception:
+                pass
+            self._serial = None
+
+        try:
+            s = serial.Serial(
+                port=self._port,
+                baudrate=self._config.baud,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=READLINE_TIMEOUT,
+                dsrdtr=False,   # CRITICAL: prevents ESP32-S2 reset on open
+                rtscts=False,   # CRITICAL: prevents ESP32-S2 reset on open
+                xonxoff=False,
+            )
+        except serial.SerialException as e:
+            raise SerialDisconnectedError(
+                f"Cannot open {self._port}: {e}"
+            ) from e
+
+        self._serial = s
+        # Schedule the event set on the event loop thread
+        # (this method runs in a worker thread)
+        try:
+            loop = asyncio.get_event_loop()
+            loop.call_soon_threadsafe(self._connected.set)
+        except RuntimeError:
+            pass
+
+        logger.info("Serial port %s opened at %d baud", self._port, self._config.baud)
