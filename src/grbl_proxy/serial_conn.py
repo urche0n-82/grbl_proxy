@@ -50,6 +50,7 @@ class SerialConnection:
     async def connect(self) -> None:
         """Open the serial port. Raises SerialDisconnectedError on failure."""
         await asyncio.to_thread(self._open_port)
+        self._connected.set()
 
     async def disconnect(self) -> None:
         """Close the serial port cleanly."""
@@ -122,6 +123,7 @@ class SerialConnection:
                 )
                 try:
                     await asyncio.to_thread(self._open_port)
+                    self._connected.set()
                     logger.info("Serial reconnected to %s", self._port)
                 except SerialDisconnectedError:
                     pass  # will retry after interval
@@ -167,12 +169,4 @@ class SerialConnection:
             ) from e
 
         self._serial = s
-        # Schedule the event set on the event loop thread
-        # (this method runs in a worker thread)
-        try:
-            loop = asyncio.get_event_loop()
-            loop.call_soon_threadsafe(self._connected.set)
-        except RuntimeError:
-            pass
-
         logger.info("Serial port %s opened at %d baud", self._port, self._config.baud)
