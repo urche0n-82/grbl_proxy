@@ -1,5 +1,5 @@
 [Unit]
-Description=GRBL Laser Proxy
+Description=GRBL Proxy
 Documentation=https://github.com/your-repo/grbl-proxy
 After=network.target
 # Wants the USB serial device to be present, but don't hard-require it —
