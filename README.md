@@ -30,76 +30,34 @@ git clone https://github.com/urche0n-82/grbl_proxy.git ~/grbl-proxy
 cd ~/grbl-proxy
 ```
 
-### 2. Create a virtual environment and install
+### 2. Run the installer
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -e .
+bash install.sh
 ```
 
-### 3. Set up configuration
+The installer handles everything: system packages, Python virtual environment, config file, port 23 capability grant, and systemd service registration. It is safe to re-run — steps that are already complete are skipped.
+
+After it finishes, review your config if needed:
 
 ```bash
-mkdir -p ~/.grbl-proxy
-cp config.yaml.example ~/.grbl-proxy/config.yaml
 nano ~/.grbl-proxy/config.yaml
 ```
 
-The defaults work for most setups. The only field you may need to change is `serial.port` if auto-detection picks the wrong device:
+The only field you may need to change is `serial.port` if auto-detection picks the wrong device:
 
 ```yaml
 serial:
   port: auto        # or /dev/ttyUSB0, /dev/ttyACM0, etc.
-  baud: 115200
-  dtr: false        # CRITICAL: keeps ESP32-S2 from resetting on connect
-
-tcp:
-  host: 0.0.0.0
-  port: 8899        # port LightBurn will connect to
 ```
 
-### 4. Add your user to the `dialout` group (for serial port access)
-
-```bash
-sudo usermod -aG dialout $USER
-# Log out and back in for this to take effect
-```
+If the installer added you to the `dialout` group, **log out and back in** before starting the service.
 
 ## Running
-
-### Manually (for testing)
-
-```bash
-source .venv/bin/activate
-grbl-proxy --debug
-```
-
-You should see output like:
-
-```
-2024-01-15T10:23:01 INFO     grbl_proxy.main: Starting grbl-proxy
-2024-01-15T10:23:01 INFO     grbl_proxy.main:   Serial port : /dev/ttyUSB0 @ 115200 baud
-2024-01-15T10:23:01 INFO     grbl_proxy.main:   TCP server  : 0.0.0.0:8899
-2024-01-15T10:23:03 INFO     grbl_proxy.serial_conn: Serial port /dev/ttyUSB0 opened at 115200 baud
-2024-01-15T10:23:03 INFO     grbl_proxy.tcp_server: TCP server listening on [('0.0.0.0', 8899)]
-2024-01-15T10:23:03 INFO     grbl_proxy.main: grbl-proxy running. Press Ctrl-C to stop.
-```
-
-Test the connection with `nc` (netcat):
-
-```bash
-nc <pi-ip> 8899
-```
-
-Type `?` and press Enter — you should get a GRBL status response like `<Idle|MPos:0.000,0.000,0.000|FS:0,0>`.
 
 ### As a systemd service (auto-start on boot)
 
 ```bash
-sudo cp systemd/grbl-proxy.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable grbl-proxy
 sudo systemctl start grbl-proxy
 ```
 
@@ -110,13 +68,27 @@ sudo systemctl status grbl-proxy
 journalctl -u grbl-proxy -f
 ```
 
+### Manually (for testing)
+
+```bash
+.venv/bin/grbl-proxy --debug
+```
+
+Type `?` into a netcat session to verify the connection:
+
+```bash
+nc <pi-ip> 23
+```
+
+You should get a GRBL status response like `<Idle|MPos:0.000,0.000,0.000|FS:0,0>`.
+
 ## LightBurn device setup
 
 1. Open LightBurn → **Devices** → **Create Manually**
 2. Select **GRBL**
 3. Connection type: **Ethernet/TCP**
 4. IP address: your Pi's static IP on the local network
-5. Port: `8899` (or `23` if configured)
+5. Port: `23`
 6. Work area: `400 × 415 mm` (adjust for your machine)
 7. Click **Finish**
 
@@ -124,16 +96,6 @@ To enable disconnect-safe job buffering (Phase 2+), add these to the device's G-
 
 - **Start G-code**: `; PROXY_JOB_START`
 - **End G-code**: `; PROXY_JOB_END`
-
-## Port 23 (LightBurn default)
-
-LightBurn defaults to port 23 for GRBL-over-TCP. Port 23 requires root or a Linux capability grant. The easiest approach:
-
-```bash
-sudo setcap 'cap_net_bind_service=+ep' $(readlink -f .venv/bin/python3)
-```
-
-Then set `tcp.port: 23` in your config. Alternatively, stay on port 8899 and set LightBurn to match.
 
 ## Development
 
