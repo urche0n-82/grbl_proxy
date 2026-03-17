@@ -76,10 +76,10 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
 
     logger.info("grbl-proxy running. Press Ctrl-C to stop.")
 
-    async with server:
-        await stop_event.wait()
+    await stop_event.wait()
 
-    # Clean up
+    # Cancel relay tasks and close TCP connections before waiting on the server,
+    # otherwise server.wait_closed() blocks on the still-running handler coroutines.
     reconnect_task.cancel()
     await asyncio.gather(reconnect_task, return_exceptions=True)
     await tcp_server.stop()
