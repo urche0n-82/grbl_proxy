@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 
 import serial
 import serial.tools.list_ports
@@ -124,28 +125,25 @@ class SerialConnection:
         the connection state and retries every config.reconnect_interval seconds
         when the port is unavailable.
 
-        Uses asyncio.wait_for with a hard timeout on the blocking open call so
-        that task cancellation (SIGINT/SIGTERM) is never delayed more than
-        OPEN_TIMEOUT seconds by a hung serial.Serial() call in a thread.
+        The device-file existence check before open() means serial.Serial() is
+        only called when the port file is present, keeping the blocking window
+        short and ensuring task cancellation (SIGINT/SIGTERM) is not delayed by
+        a hung open() on a disconnected USB device.
         """
-        OPEN_TIMEOUT = 4.0  # seconds — must be < reconnect_interval
-
         while not self._shutting_down:
             if not self._connected.is_set():
-                logger.info(
-                    "Attempting serial reconnect to %s ...", self._port
-                )
-                try:
-                    await asyncio.wait_for(
-                        asyncio.to_thread(self._open_port),
-                        timeout=OPEN_TIMEOUT,
+                # Only attempt open if the device file exists — avoids a long
+                # blocking serial.Serial() call on a missing/disconnected port.
+                if os.path.exists(self._port):
+                    logger.info(
+                        "Attempting serial reconnect to %s ...", self._port
                     )
-                    self._connected.set()
-                    logger.info("Serial reconnected to %s", self._port)
-                except SerialDisconnectedError:
-                    pass  # will retry after interval
-                except asyncio.TimeoutError:
-                    logger.debug("Serial open timed out — will retry")
+                    try:
+                        await asyncio.to_thread(self._open_port)
+                        self._connected.set()
+                        logger.info("Serial reconnected to %s", self._port)
+                    except SerialDisconnectedError:
+                        pass  # will retry after interval
 
             await asyncio.sleep(self._config.reconnect_interval)
 
