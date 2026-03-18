@@ -10,8 +10,15 @@ import re
 from typing import TypedDict
 
 
-# Real-time command bytes (single characters, bypass line buffer, no ok response)
-REALTIME_COMMANDS = frozenset(b"?!~\x18")
+# Real-time command bytes — bypass the line buffer, no 'ok' response.
+# Basic set: status query, feed hold, cycle resume, soft reset.
+_REALTIME_BASIC = frozenset(b"?!~\x18")
+# Extended real-time commands (GRBL 1.1 §4.4): all single bytes >= 0x80.
+# Includes 0x85 (jog cancel), 0x84 (safety door), 0x90-0x9F (feed/spindle
+# overrides), 0xA0-0xA1 (coolant toggles). Any byte in this range must be
+# forwarded immediately as-is — never accumulated in a line buffer.
+_REALTIME_EXTENDED = frozenset(range(0x80, 0xA2))
+REALTIME_COMMANDS = _REALTIME_BASIC | _REALTIME_EXTENDED
 
 # Motion/laser G-code prefixes that indicate a job stream vs interactive use
 MOTION_COMMAND_PREFIXES = ("G0", "G1", "G2", "G3", "M3", "M4", "M5", "S")

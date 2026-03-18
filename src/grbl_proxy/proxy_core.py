@@ -173,8 +173,12 @@ class ProxyCore:
                     logger.debug("Serial unavailable for realtime '?': %s", e)
             return True
 
-        # Feed hold (!), cycle resume (~), soft reset (Ctrl-X)
-        if self._state == ProxyState.BUFFERING:
+        # Feed hold (!), cycle resume (~), soft reset (Ctrl-X) during buffering
+        # discard the incomplete job. Extended real-time bytes (>= 0x80, e.g.
+        # jog cancel 0x85, overrides) are just forwarded — they don't affect
+        # the buffer state.
+        _DISCARD_DURING_BUFFER = frozenset([ord("!"), ord("~"), 0x18])
+        if self._state == ProxyState.BUFFERING and byte in _DISCARD_DURING_BUFFER:
             logger.warning(
                 "Realtime command 0x%02x received during Buffering — discarding job",
                 byte,
