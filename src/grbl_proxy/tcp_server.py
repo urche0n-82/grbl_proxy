@@ -19,11 +19,18 @@ from grbl_proxy.serial_conn import SerialDisconnectedError
 
 logger = logging.getLogger(__name__)
 
+# Avoid a circular import: proxy_core imports grbl_protocol but not tcp_server.
+# Import ProxyCore lazily via TYPE_CHECKING so it's available for type hints
+# but not loaded at module import time.
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from grbl_proxy.proxy_core import ProxyCore
+
 
 class TcpServer:
     """Manages a single LightBurn TCP connection and the bidirectional relay."""
 
-    def __init__(self, host: str, port: int, serial_conn) -> None:
+    def __init__(self, host: str, port: int, serial_conn, proxy_core: "ProxyCore | None" = None) -> None:
         """
         Args:
             host: Bind address (e.g. "0.0.0.0").
@@ -31,13 +38,17 @@ class TcpServer:
             serial_conn: Any object implementing the SerialConnection interface
                          (read_line, write, connect, disconnect). Accepts
                          MockSerialConnection for testing.
+            proxy_core: Optional Phase 2+ state machine. When None (default),
+                        the server behaves as a pure Phase 1 passthrough relay.
         """
         self._host = host
         self._port = port
         self._serial = serial_conn
+        self._proxy = proxy_core
         self._current_writer: asyncio.StreamWriter | None = None
         self._relay_tasks: list[asyncio.Task] = []
         self._server: asyncio.Server | None = None
+        self._line_buf: bytearray = bytearray()  # per-connection line reassembly
 
     async def start(self) -> asyncio.Server:
         """Start listening and return the asyncio.Server object."""
@@ -68,9 +79,14 @@ class TcpServer:
         logger.info("TCP client connected: %s", peer)
 
         # Drop any existing connection before taking the new one
+        # (_drop_current_client also calls on_client_disconnected if proxy set)
         await self._drop_current_client("new client connected")
 
         self._current_writer = writer
+        self._line_buf.clear()
+
+        if self._proxy is not None:
+            self._proxy.on_client_connected()
 
         t1 = asyncio.create_task(
             self._tcp_to_serial(reader), name="tcp-to-serial"
@@ -80,15 +96,27 @@ class TcpServer:
         )
         self._relay_tasks = [t1, t2]
 
-        # Wait for both directions; exceptions are captured, not re-raised
+        # Wait until one direction exits, then cancel the other.
+        # This ensures both tasks stop promptly when LightBurn closes the connection
+        # (EOF on _tcp_to_serial would otherwise leave _serial_to_tcp blocked forever).
+        done, pending = await asyncio.wait(
+            [t1, t2], return_when=asyncio.FIRST_COMPLETED
+        )
+        for task in pending:
+            task.cancel()
         results = await asyncio.gather(t1, t2, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
                 logger.debug("Relay task ended with: %r", r)
 
+        # Natural EOF path: notify proxy of disconnection (idempotent)
+        if self._proxy is not None:
+            await self._proxy.on_client_disconnected()
+
         logger.info("TCP client disconnected: %s", peer)
         self._current_writer = None
         self._relay_tasks = []
+        self._line_buf.clear()
 
     async def _drop_current_client(self, reason: str) -> None:
         """Cancel relay tasks and close the current writer."""
@@ -96,6 +124,10 @@ class TcpServer:
             return
 
         logger.warning("Dropping current TCP client: %s", reason)
+
+        # Notify state machine of disconnect before cancelling tasks
+        if self._proxy is not None:
+            await self._proxy.on_client_disconnected()
 
         for task in self._relay_tasks:
             if not task.done():
@@ -128,12 +160,38 @@ class TcpServer:
 
             logger.debug("TCP→Serial: %r", data)
 
-            try:
-                await self._serial.write(data)
-            except SerialDisconnectedError as e:
-                logger.warning("Serial unavailable during TCP→Serial relay: %s", e)
-                # Keep reading from TCP; the reconnect loop will restore serial
-                # Once serial comes back, writes will succeed again.
+            if self._proxy is None:
+                # Phase 1 passthrough: raw byte forwarding
+                try:
+                    await self._serial.write(data)
+                except SerialDisconnectedError as e:
+                    logger.warning("Serial unavailable during TCP→Serial relay: %s", e)
+                    # Keep reading from TCP; reconnect loop will restore serial
+            else:
+                # Phase 2+: route through ProxyCore
+                writer = self._current_writer
+                if writer is None:
+                    break
+                await self._route_bytes(data, writer)
+
+    async def _route_bytes(self, data: bytes, writer: asyncio.StreamWriter) -> None:
+        """Process incoming bytes through ProxyCore, assembling lines."""
+        for byte in data:
+            # Check for real-time commands before adding to line buffer
+            consumed = await self._proxy.process_raw_byte(byte, writer, self._serial)
+            if consumed:
+                continue
+
+            self._line_buf.append(byte)
+
+            if byte == ord("\n"):
+                line = self._line_buf.decode(errors="replace").rstrip("\r\n")
+                self._line_buf.clear()
+                if line:  # skip blank lines
+                    try:
+                        await self._proxy.process_client_line(line, writer, self._serial)
+                    except SerialDisconnectedError as e:
+                        logger.warning("Serial unavailable during routing: %s", e)
 
     async def _serial_to_tcp(self, writer: asyncio.StreamWriter) -> None:
         """Forward lines from GRBL (serial) back to LightBurn (TCP)."""
@@ -154,11 +212,13 @@ class TcpServer:
                 # Timeout tick from read_line — no data, keep looping
                 continue
 
-            # Snoop on status reports: log machine state (Phase 2 will act on this)
+            # Snoop on status reports: log and cache for synthetic responses
             if grbl_protocol.is_status_report(line):
                 status = grbl_protocol.parse_status_report(line)
                 if status:
                     logger.debug("Machine status: %s", status)
+                    if self._proxy is not None:
+                        self._proxy.update_last_status(status)
 
             encoded = (line + "\n").encode()
             logger.debug("Serial→TCP: %r", encoded)

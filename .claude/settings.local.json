@@ -1,7 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(.venv/bin/pytest tests/test_phase1.py -q)"
+      "Bash(.venv/bin/pytest tests/test_phase1.py -q)",
+      "Bash(.venv/bin/pytest tests/ -v)"
     ]
   }
 }

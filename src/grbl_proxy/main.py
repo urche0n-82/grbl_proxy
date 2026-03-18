@@ -13,6 +13,7 @@ import sys
 from pathlib import Path
 
 from grbl_proxy.config import load_config, resolve_serial_port
+from grbl_proxy.proxy_core import ProxyCore
 from grbl_proxy.serial_conn import SerialConnection, SerialDisconnectedError
 from grbl_proxy.tcp_server import TcpServer
 
@@ -60,7 +61,8 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
         serial_conn.run_reconnect_loop(), name="serial-reconnect"
     )
 
-    tcp_server = TcpServer(config.tcp.host, config.tcp.port, serial_conn)
+    proxy_core = ProxyCore(config.job)
+    tcp_server = TcpServer(config.tcp.host, config.tcp.port, serial_conn, proxy_core=proxy_core)
     server = await tcp_server.start()
 
     # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C)
