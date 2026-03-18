@@ -63,7 +63,12 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
 
     proxy_core = ProxyCore(config.job)
     tcp_server = TcpServer(config.tcp.host, config.tcp.port, serial_conn, proxy_core=proxy_core)
-    server = await tcp_server.start()
+    try:
+        server = await tcp_server.start()
+    except OSError as e:
+        logger.error("%s", e)
+        await serial_conn.disconnect()
+        return
 
     # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C)
     loop = asyncio.get_running_loop()

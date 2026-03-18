@@ -52,11 +52,20 @@ class TcpServer:
 
     async def start(self) -> asyncio.Server:
         """Start listening and return the asyncio.Server object."""
-        self._server = await asyncio.start_server(
-            self._client_connected,
-            host=self._host,
-            port=self._port,
-        )
+        try:
+            self._server = await asyncio.start_server(
+                self._client_connected,
+                host=self._host,
+                port=self._port,
+                reuse_address=True,
+            )
+        except OSError as e:
+            raise OSError(
+                f"Cannot bind TCP server on port {self._port}: {e}\n"
+                f"Is another instance of grbl-proxy already running?\n"
+                f"  sudo systemctl stop grbl-proxy\n"
+                f"  sudo ss -tlnp | grep {self._port}"
+            ) from e
         addrs = [s.getsockname() for s in self._server.sockets]
         logger.info("TCP server listening on %s", addrs)
         return self._server
