@@ -190,6 +190,7 @@ class TcpServer:
                     await self._route_bytes(data, writer)
         finally:
             # Signal _serial_to_tcp to exit (LightBurn disconnected or task cancelled)
+            logger.debug("_tcp_to_serial: exiting, setting stop_relay")
             stop_relay.set()
 
     async def _route_bytes(self, data: bytes, writer: asyncio.StreamWriter) -> None:
@@ -234,6 +235,7 @@ class TcpServer:
                 stop_task.cancel()
 
             if stop_relay.is_set():
+                logger.debug("_serial_to_tcp: stop_relay set, exiting")
                 read_task.cancel()
                 break
 
