@@ -202,23 +202,27 @@ class TcpServer:
     ) -> None:
         """Forward lines from GRBL (serial) back to LightBurn (TCP)."""
         while not stop_relay.is_set():
+            # Race read_line() against stop_relay so _serial_to_tcp wakes up
+            # promptly when the TCP side closes, rather than blocking until the
+            # next 1-second serial readline timeout tick.
+            read_task = asyncio.create_task(self._serial.read_line())
+            stop_task = asyncio.create_task(stop_relay.wait())
             try:
-                # Race read_line() against stop_relay so that when the TCP side
-                # closes (EOF), this task wakes up promptly instead of blocking
-                # in serial.read_line() until the next 1-second timeout tick.
-                read_task = asyncio.ensure_future(self._serial.read_line())
-                stop_task = asyncio.ensure_future(stop_relay.wait())
-                try:
-                    done, _ = await asyncio.wait(
-                        [read_task, stop_task], return_when=asyncio.FIRST_COMPLETED
-                    )
-                finally:
-                    stop_task.cancel()
+                await asyncio.wait(
+                    [read_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+                )
+            except asyncio.CancelledError:
+                read_task.cancel()
+                stop_task.cancel()
+                raise
+            finally:
+                stop_task.cancel()
 
-                if stop_relay.is_set():
-                    read_task.cancel()
-                    break
+            if stop_relay.is_set():
+                read_task.cancel()
+                break
 
+            try:
                 line = read_task.result()
             except SerialDisconnectedError as e:
                 logger.warning("Serial disconnected during relay: %s", e)

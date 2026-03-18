@@ -15,7 +15,8 @@ from unittest.mock import patch
 import pytest
 
 from grbl_proxy import grbl_protocol
-from grbl_proxy.config import Config, SerialConfig, TcpConfig, load_config, resolve_serial_port
+from grbl_proxy.config import AutoDetectConfig, Config, JobConfig, SerialConfig, TcpConfig, load_config, resolve_serial_port
+from grbl_proxy.proxy_core import ProxyCore
 from grbl_proxy.tcp_server import TcpServer
 from tests.mock_grbl import MockSerialConnection
 
@@ -330,3 +331,132 @@ class TestTcpRelay:
             await server.stop()
 
         assert line == b"ALARM:1\n"
+
+
+# ---------------------------------------------------------------------------
+# Shutdown / SIGINT regression tests
+#
+# These tests guard against a previous bug where server.stop() (the SIGINT
+# path) would hang indefinitely when a client was connected. The root cause
+# was _serial_to_tcp blocking in asyncio.to_thread(serial.readline) with no
+# way to be interrupted — the CancelledError from task.cancel() was swallowed
+# by leaked ensure_future tasks, preventing the event loop from exiting.
+#
+# Each test asserts that server.stop() completes within 2 seconds. If the bug
+# regresses the test hangs and pytest's own timeout (or asyncio.wait_for) will
+# report a TimeoutError rather than a silent hang.
+# ---------------------------------------------------------------------------
+
+_STOP_TIMEOUT = 2.0  # seconds — stop() must complete within this time
+
+
+class TestShutdownWithClientConnected:
+    async def test_stop_while_client_connected_no_proxy(self):
+        """server.stop() completes promptly with an active client (no ProxyCore).
+
+        Regression: _serial_to_tcp was stuck in read_line() with no interrupt
+        path, so stop() would hang until the 1-second readline timeout fired —
+        and with multiple leaked tasks it never returned at all.
+        """
+        mock = MockSerialConnection(auto_respond=True)
+        server = TcpServer("127.0.0.1", _BASE_PORT + 7, mock)
+        await server.start()
+
+        reader, writer = await _connect(_BASE_PORT + 7)
+        # Exchange a round-trip to confirm the relay is running
+        writer.write(b"?\n")
+        await writer.drain()
+        await asyncio.wait_for(reader.readline(), timeout=2.0)
+
+        # This must complete quickly — if it hangs the bug has regressed
+        await asyncio.wait_for(server.stop(), timeout=_STOP_TIMEOUT)
+
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    async def test_stop_while_client_idle_no_proxy(self):
+        """server.stop() completes promptly when client is connected but silent.
+
+        _serial_to_tcp was blocked waiting for serial data that never arrives
+        (no ? polling from client). stop() must still cancel it cleanly.
+        """
+        mock = MockSerialConnection(auto_respond=False)
+        server = TcpServer("127.0.0.1", _BASE_PORT + 8, mock)
+        await server.start()
+
+        reader, writer = await _connect(_BASE_PORT + 8)
+        # Do NOT send any commands — _serial_to_tcp is blocked in read_line()
+        await asyncio.sleep(0.05)
+
+        await asyncio.wait_for(server.stop(), timeout=_STOP_TIMEOUT)
+
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    async def test_stop_while_client_connected_with_proxy(self, tmp_path):
+        """server.stop() completes promptly with ProxyCore attached (Phase 2 path).
+
+        The Phase 2 routing path creates additional tasks per loop iteration.
+        Verifies CancelledError propagates correctly through the stop_relay
+        event mechanism even with ProxyCore's byte-routing active.
+        """
+        cfg = JobConfig(
+            storage_dir=str(tmp_path / "jobs"),
+            auto_detect=AutoDetectConfig(enabled=False),
+        )
+        mock = MockSerialConnection(auto_respond=True)
+        core = ProxyCore(cfg, idle_timeout_s=0.1)
+        server = TcpServer("127.0.0.1", _BASE_PORT + 9, mock, proxy_core=core)
+        await server.start()
+
+        reader, writer = await _connect(_BASE_PORT + 9)
+        # Exchange several round-trips to ensure relay tasks are deep in their loop
+        for _ in range(3):
+            writer.write(b"?\n")
+            await writer.drain()
+            await asyncio.wait_for(reader.readline(), timeout=2.0)
+
+        await asyncio.wait_for(server.stop(), timeout=_STOP_TIMEOUT)
+
+        try:
+            writer.close()
+        except Exception:
+            pass
+
+    async def test_stop_during_rapid_polling(self):
+        """server.stop() completes during high-frequency ? polling.
+
+        Sends ? queries back-to-back before calling stop(), maximising the
+        chance that _serial_to_tcp is mid-wait when cancellation arrives.
+        """
+        mock = MockSerialConnection(auto_respond=True)
+        server = TcpServer("127.0.0.1", _BASE_PORT + 10, mock)
+        await server.start()
+
+        reader, writer = await _connect(_BASE_PORT + 10)
+
+        # Flood the relay with status queries concurrently with stop()
+        async def _poll():
+            try:
+                while True:
+                    writer.write(b"?\n")
+                    await writer.drain()
+                    await asyncio.sleep(0.01)
+            except Exception:
+                pass
+
+        poll_task = asyncio.create_task(_poll())
+        await asyncio.sleep(0.1)  # let polling run for a bit
+
+        await asyncio.wait_for(server.stop(), timeout=_STOP_TIMEOUT)
+
+        poll_task.cancel()
+        await asyncio.gather(poll_task, return_exceptions=True)
+        try:
+            writer.close()
+        except Exception:
+            pass
