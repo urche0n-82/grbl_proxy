@@ -70,7 +70,7 @@ class JobBuffer:
         """Close and delete the job file and metadata file (if they exist)."""
         self._discarded = True
         await asyncio.to_thread(self._discard_sync)
-        logger.debug("Job buffer discarded")
+        logger.info("Job buffer discarded")
 
     async def finalize(self) -> JobMetadata:
         """Flush, close, write metadata JSON, and return JobMetadata."""
@@ -85,7 +85,7 @@ class JobBuffer:
         )
         await asyncio.to_thread(self._finalize_sync, meta)
         self._finalized = True
-        logger.debug(
+        logger.info(
             "Job buffer finalized: %d lines at %s", self._line_count, self._path
         )
         return meta

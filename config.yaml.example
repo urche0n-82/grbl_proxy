@@ -21,10 +21,7 @@ job:
   start_marker: "; PROXY_JOB_START"
   end_marker: "; PROXY_JOB_END"
   auto_detect:
-    enabled: true
-    line_burst: 10
-    window_ms: 500
-    motion_ratio: 0.8
+    enabled: false    # disabled: framing/jogging bursts trigger false positives
 
 machine:
   name: "Falcon 2 Pro"

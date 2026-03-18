@@ -541,46 +541,54 @@ class TestBufferingMode:
 
 
 class TestHeuristicTrigger:
-    async def test_burst_triggers_buffering(self, tmp_path):
-        """Rapid burst of motion commands (no explicit marker) triggers Buffering."""
+    async def test_burst_does_not_trigger_buffering(self, tmp_path):
+        """Rapid burst of motion commands (framing/jogging) stays in Passthrough.
+
+        The heuristic auto-detect is disabled by default because framing in
+        LightBurn produces the same burst pattern as a real job start, making it
+        unreliable. Only the explicit ; PROXY_JOB_START marker triggers buffering.
+        """
         server, mock, core = _make_server(_BASE_PORT + 14, tmp_path / "jobs")
         await server.start()
         try:
             reader, writer = await _connect(_BASE_PORT + 14)
 
-            # Send 5 motion commands fast — should trigger heuristic (burst=5, ratio=0.8)
+            # Send 5 motion commands fast — same pattern as framing
             for i in range(5):
                 writer.write(f"G0 X{i}\n".encode())
             await writer.drain()
 
-            # Consume responses (from serial mock auto_respond=True in passthrough)
-            # or spoofed ok in buffering — either way read them
             for _ in range(5):
                 await asyncio.wait_for(reader.readline(), timeout=2.0)
 
             await asyncio.sleep(0.05)
-            assert core.state == ProxyState.BUFFERING
+            # Must stay in Passthrough — framing should not be buffered
+            assert core.state == ProxyState.PASSTHROUGH
 
             writer.close()
             await writer.wait_closed()
         finally:
             await server.stop()
 
-    async def test_sparse_commands_do_not_trigger(self, tmp_path):
-        """Commands sent with long gaps do NOT trigger heuristic buffering."""
+    async def test_only_explicit_marker_triggers_buffering(self, tmp_path):
+        """Buffering only starts when the explicit start marker is received."""
         server, mock, core = _make_server(_BASE_PORT + 15, tmp_path / "jobs")
         await server.start()
         try:
             reader, writer = await _connect(_BASE_PORT + 15)
 
-            # Send 3 motion commands with 200ms gaps — each falls outside 300ms window
-            for i in range(3):
+            # Burst of motion commands — no trigger
+            for i in range(10):
                 writer.write(f"G0 X{i}\n".encode())
-                await writer.drain()
+            await writer.drain()
+            for _ in range(10):
                 await asyncio.wait_for(reader.readline(), timeout=2.0)
-                await asyncio.sleep(0.2)
 
             assert core.state == ProxyState.PASSTHROUGH
+
+            # Now send the explicit marker — this should trigger
+            await _enter_buffering(reader, writer)
+            assert core.state == ProxyState.BUFFERING
 
             writer.close()
             await writer.wait_closed()

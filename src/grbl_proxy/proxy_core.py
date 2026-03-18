@@ -230,6 +230,7 @@ class ProxyCore:
                 return
 
             # Normal buffered line
+            logger.debug("Buffering: %s", line)
             if self._buffer is not None:
                 await self._buffer.write_line(line)
             await self._spoof_ok(writer)
@@ -257,13 +258,7 @@ class ProxyCore:
 
     def _check_job_start(self, line: str) -> bool:
         """Return True if this line should trigger a transition to Buffering."""
-        # Primary: explicit start marker
-        if line.strip() == self._cfg.start_marker:
-            return True
-        # Fallback: rapid-fire heuristic
-        if self._detector and self._detector.feed(line):
-            return True
-        return False
+        return line.strip() == self._cfg.start_marker
 
     async def _enter_buffering(self, first_line: str, writer: asyncio.StreamWriter) -> None:
         """Transition to BUFFERING, open the job buffer, write the first line."""

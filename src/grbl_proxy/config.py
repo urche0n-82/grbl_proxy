@@ -38,7 +38,7 @@ class WebConfig:
 
 @dataclass
 class AutoDetectConfig:
-    enabled: bool = True
+    enabled: bool = False
     line_burst: int = 10
     window_ms: int = 500
     motion_ratio: float = 0.8
