@@ -7,6 +7,7 @@ clean systemd shutdown. Invoked via the `grbl-proxy` console script.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
 import signal
 import sys
@@ -115,7 +116,18 @@ def run() -> None:
     )
     args = parser.parse_args()
 
+    # Use a custom executor so we can shut it down without waiting for
+    # blocking threads (e.g. serial.Serial() open calls) on SIGINT/SIGTERM.
+    executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="grbl-proxy")
+    loop = asyncio.new_event_loop()
+    loop.set_default_executor(executor)
     try:
-        asyncio.run(_main(config_path=args.config, debug=args.debug))
+        loop.run_until_complete(_main(config_path=args.config, debug=args.debug))
     except KeyboardInterrupt:
         pass
+    finally:
+        # Shut down executor without waiting for blocked threads to finish.
+        # This allows the process to exit even if a serial.Serial() call is
+        # stuck in a thread pool worker.
+        executor.shutdown(wait=False, cancel_futures=True)
+        loop.close()
