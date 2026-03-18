@@ -235,6 +235,7 @@ class ProxyCore:
             # but do finalize — the file is self-contained without it)
             if _normalize_gcode(line) == _normalize_gcode(self._cfg.end_marker):
                 await self._finalize_job()
+                await self._spoof_ok(writer)
                 return
 
             if is_program_end_command(line):
