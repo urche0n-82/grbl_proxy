@@ -201,6 +201,7 @@ class TcpServer:
                 line = self._line_buf.decode(errors="replace").rstrip("\r\n")
                 self._line_buf.clear()
                 if line:  # skip blank lines
+                    logger.debug("Route [%s]: %s", self._proxy.state.value, line)
                     try:
                         await self._proxy.process_client_line(line, writer, self._serial)
                     except SerialDisconnectedError as e:
