@@ -157,15 +157,20 @@ class TcpServer:
     ) -> None:
         """Forward lines from LightBurn (TCP) to the serial port."""
         try:
+            logger.debug("_tcp_to_serial: task started, stop_relay=%s", stop_relay.is_set())
             while not stop_relay.is_set():
+                logger.debug("_tcp_to_serial: waiting for data (stop_relay=%s)", stop_relay.is_set())
                 try:
                     data = await reader.read(256)
                 except (ConnectionResetError, BrokenPipeError) as e:
                     logger.debug("TCP read error: %s", e)
                     break
 
+                logger.debug("_tcp_to_serial: read returned %d bytes", len(data))
+
                 if not data:
                     # EOF — LightBurn closed the connection
+                    logger.debug("_tcp_to_serial: EOF received")
                     break
 
                 logger.debug("TCP→Serial: %r", data)
