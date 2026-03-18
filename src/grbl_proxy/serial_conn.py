@@ -124,22 +124,28 @@ class SerialConnection:
         the connection state and retries every config.reconnect_interval seconds
         when the port is unavailable.
 
-        Exits cleanly when cancelled (e.g. on SIGINT/SIGTERM). If blocked inside
-        asyncio.to_thread(_open_port), the CancelledError is re-raised after the
-        thread returns — the thread itself cannot be interrupted, but serial.Serial()
-        raises quickly when the port is absent, so shutdown completes promptly.
+        Uses asyncio.wait_for with a hard timeout on the blocking open call so
+        that task cancellation (SIGINT/SIGTERM) is never delayed more than
+        OPEN_TIMEOUT seconds by a hung serial.Serial() call in a thread.
         """
+        OPEN_TIMEOUT = 4.0  # seconds — must be < reconnect_interval
+
         while not self._shutting_down:
             if not self._connected.is_set():
                 logger.info(
                     "Attempting serial reconnect to %s ...", self._port
                 )
                 try:
-                    await asyncio.to_thread(self._open_port)
+                    await asyncio.wait_for(
+                        asyncio.to_thread(self._open_port),
+                        timeout=OPEN_TIMEOUT,
+                    )
                     self._connected.set()
                     logger.info("Serial reconnected to %s", self._port)
                 except SerialDisconnectedError:
                     pass  # will retry after interval
+                except asyncio.TimeoutError:
+                    logger.debug("Serial open timed out — will retry")
 
             await asyncio.sleep(self._config.reconnect_interval)
 
