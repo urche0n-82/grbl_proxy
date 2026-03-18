@@ -88,22 +88,20 @@ class TcpServer:
         if self._proxy is not None:
             self._proxy.on_client_connected()
 
+        # Shared event: set by either relay task to signal the other to stop.
+        # This avoids FIRST_COMPLETED (which kills the connection on any transient
+        # serial error) while still ensuring _serial_to_tcp exits promptly when
+        # LightBurn closes the TCP connection (EOF on _tcp_to_serial).
+        stop_relay = asyncio.Event()
+
         t1 = asyncio.create_task(
-            self._tcp_to_serial(reader), name="tcp-to-serial"
+            self._tcp_to_serial(reader, stop_relay), name="tcp-to-serial"
         )
         t2 = asyncio.create_task(
-            self._serial_to_tcp(writer), name="serial-to-tcp"
+            self._serial_to_tcp(writer, stop_relay), name="serial-to-tcp"
         )
         self._relay_tasks = [t1, t2]
 
-        # Wait until one direction exits, then cancel the other.
-        # This ensures both tasks stop promptly when LightBurn closes the connection
-        # (EOF on _tcp_to_serial would otherwise leave _serial_to_tcp blocked forever).
-        done, pending = await asyncio.wait(
-            [t1, t2], return_when=asyncio.FIRST_COMPLETED
-        )
-        for task in pending:
-            task.cancel()
         results = await asyncio.gather(t1, t2, return_exceptions=True)
         for r in results:
             if isinstance(r, Exception) and not isinstance(r, asyncio.CancelledError):
@@ -145,34 +143,40 @@ class TcpServer:
                 pass
             self._current_writer = None
 
-    async def _tcp_to_serial(self, reader: asyncio.StreamReader) -> None:
+    async def _tcp_to_serial(
+        self, reader: asyncio.StreamReader, stop_relay: asyncio.Event
+    ) -> None:
         """Forward lines from LightBurn (TCP) to the serial port."""
-        while True:
-            try:
-                data = await reader.read(256)
-            except (ConnectionResetError, BrokenPipeError) as e:
-                logger.debug("TCP read error: %s", e)
-                break
-
-            if not data:
-                # EOF — LightBurn closed the connection
-                break
-
-            logger.debug("TCP→Serial: %r", data)
-
-            if self._proxy is None:
-                # Phase 1 passthrough: raw byte forwarding
+        try:
+            while not stop_relay.is_set():
                 try:
-                    await self._serial.write(data)
-                except SerialDisconnectedError as e:
-                    logger.warning("Serial unavailable during TCP→Serial relay: %s", e)
-                    # Keep reading from TCP; reconnect loop will restore serial
-            else:
-                # Phase 2+: route through ProxyCore
-                writer = self._current_writer
-                if writer is None:
+                    data = await reader.read(256)
+                except (ConnectionResetError, BrokenPipeError) as e:
+                    logger.debug("TCP read error: %s", e)
                     break
-                await self._route_bytes(data, writer)
+
+                if not data:
+                    # EOF — LightBurn closed the connection
+                    break
+
+                logger.debug("TCP→Serial: %r", data)
+
+                if self._proxy is None:
+                    # Phase 1 passthrough: raw byte forwarding
+                    try:
+                        await self._serial.write(data)
+                    except SerialDisconnectedError as e:
+                        logger.warning("Serial unavailable during TCP→Serial relay: %s", e)
+                        # Keep reading from TCP; reconnect loop will restore serial
+                else:
+                    # Phase 2+: route through ProxyCore
+                    writer = self._current_writer
+                    if writer is None:
+                        break
+                    await self._route_bytes(data, writer)
+        finally:
+            # Signal _serial_to_tcp to exit (LightBurn disconnected or task cancelled)
+            stop_relay.set()
 
     async def _route_bytes(self, data: bytes, writer: asyncio.StreamWriter) -> None:
         """Process incoming bytes through ProxyCore, assembling lines."""
@@ -193,11 +197,29 @@ class TcpServer:
                     except SerialDisconnectedError as e:
                         logger.warning("Serial unavailable during routing: %s", e)
 
-    async def _serial_to_tcp(self, writer: asyncio.StreamWriter) -> None:
+    async def _serial_to_tcp(
+        self, writer: asyncio.StreamWriter, stop_relay: asyncio.Event
+    ) -> None:
         """Forward lines from GRBL (serial) back to LightBurn (TCP)."""
-        while True:
+        while not stop_relay.is_set():
             try:
-                line = await self._serial.read_line()
+                # Race read_line() against stop_relay so that when the TCP side
+                # closes (EOF), this task wakes up promptly instead of blocking
+                # in serial.read_line() until the next 1-second timeout tick.
+                read_task = asyncio.ensure_future(self._serial.read_line())
+                stop_task = asyncio.ensure_future(stop_relay.wait())
+                try:
+                    done, _ = await asyncio.wait(
+                        [read_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+                    )
+                finally:
+                    stop_task.cancel()
+
+                if stop_relay.is_set():
+                    read_task.cancel()
+                    break
+
+                line = read_task.result()
             except SerialDisconnectedError as e:
                 logger.warning("Serial disconnected during relay: %s", e)
                 # Notify LightBurn that the machine is unavailable
@@ -206,6 +228,7 @@ class TcpServer:
                     await writer.drain()
                 except (BrokenPipeError, ConnectionResetError):
                     pass
+                stop_relay.set()
                 break
 
             if not line:
@@ -228,4 +251,5 @@ class TcpServer:
                 await writer.drain()
             except (BrokenPipeError, ConnectionResetError) as e:
                 logger.debug("TCP write error (client gone): %s", e)
+                stop_relay.set()
                 break
