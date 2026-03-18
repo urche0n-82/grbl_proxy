@@ -52,6 +52,14 @@ class SerialConnection:
         await asyncio.to_thread(self._open_port)
         self._connected.set()
 
+    def signal_shutdown(self) -> None:
+        """Mark the connection as shutting down (synchronous — safe from signal handlers).
+
+        Must be called before cancelling the reconnect task so that any in-progress
+        asyncio.to_thread(_open_port) call is skipped on the next iteration.
+        """
+        self._shutting_down = True
+
     async def disconnect(self) -> None:
         """Close the serial port cleanly."""
         self._shutting_down = True
@@ -115,6 +123,11 @@ class SerialConnection:
         Run this as an asyncio.Task alongside the rest of the proxy. It monitors
         the connection state and retries every config.reconnect_interval seconds
         when the port is unavailable.
+
+        Exits cleanly when cancelled (e.g. on SIGINT/SIGTERM). If blocked inside
+        asyncio.to_thread(_open_port), the CancelledError is re-raised after the
+        thread returns — the thread itself cannot be interrupted, but serial.Serial()
+        raises quickly when the port is absent, so shutdown completes promptly.
         """
         while not self._shutting_down:
             if not self._connected.is_set():
@@ -144,6 +157,9 @@ class SerialConnection:
 
     def _open_port(self) -> None:
         """Blocking: open the serial port. Sets _connected on success."""
+        if self._shutting_down:
+            raise SerialDisconnectedError("Shutting down")
+
         if self._serial is not None:
             try:
                 self._serial.close()

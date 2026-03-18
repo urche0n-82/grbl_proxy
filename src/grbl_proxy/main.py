@@ -85,8 +85,10 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
 
     await stop_event.wait()
 
-    # Cancel relay tasks and close TCP connections before waiting on the server,
-    # otherwise server.wait_closed() blocks on the still-running handler coroutines.
+    # Signal reconnect loop to stop before cancelling — this lets the while-loop
+    # condition exit cleanly and prevents the default executor from blocking on
+    # a serial.Serial() call in a background thread after the task is cancelled.
+    serial_conn.signal_shutdown()
     reconnect_task.cancel()
     await asyncio.gather(reconnect_task, return_exceptions=True)
     await tcp_server.stop()
