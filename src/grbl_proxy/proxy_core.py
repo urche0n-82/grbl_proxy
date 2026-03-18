@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import re
 import time
 from collections import deque
 from pathlib import Path
@@ -39,6 +40,14 @@ class ProxyState(enum.Enum):
 # ---------------------------------------------------------------------------
 # Module-level pure helpers
 # ---------------------------------------------------------------------------
+
+
+def _normalize_gcode(line: str) -> str:
+    """Normalize a G-code line for comparison: uppercase, collapse whitespace,
+    strip leading zeros from G/M word numbers (G04 → G4, M03 → M3)."""
+    s = " ".join(line.strip().upper().split())
+    # Strip leading zeros in word numbers: G04 → G4, M03 → M3, P0.0 stays P0.0
+    return re.sub(r'([A-Z])0+(\d)', r'\1\2', s)
 
 
 def is_program_end_command(line: str) -> bool:
@@ -213,7 +222,7 @@ class ProxyCore:
         """
         if self._state == ProxyState.PASSTHROUGH:
             if self._check_job_start(line):
-                await self._enter_buffering(line, writer)
+                await self._enter_buffering(writer)
             else:
                 try:
                     await serial_conn.write((line + "\n").encode())
@@ -224,7 +233,7 @@ class ProxyCore:
         elif self._state == ProxyState.BUFFERING:
             # Check for end marker first (don't write the marker line itself
             # but do finalize — the file is self-contained without it)
-            if line.strip() == self._cfg.end_marker:
+            if _normalize_gcode(line) == _normalize_gcode(self._cfg.end_marker):
                 await self._finalize_job()
                 return
 
@@ -262,10 +271,10 @@ class ProxyCore:
 
     def _check_job_start(self, line: str) -> bool:
         """Return True if this line should trigger a transition to Buffering."""
-        return line.strip() == self._cfg.start_marker
+        return _normalize_gcode(line) == _normalize_gcode(self._cfg.start_marker)
 
-    async def _enter_buffering(self, first_line: str, writer: asyncio.StreamWriter) -> None:
-        """Transition to BUFFERING, open the job buffer, write the first line."""
+    async def _enter_buffering(self, writer: asyncio.StreamWriter) -> None:
+        """Transition to BUFFERING and open the job buffer."""
         logger.info("Job start detected — entering Buffering state")
         buf = JobBuffer(self._storage_dir, start_time=time.time())
         try:
@@ -281,7 +290,6 @@ class ProxyCore:
         self._state = ProxyState.BUFFERING
         if self._detector:
             self._detector.reset()
-        await self._buffer.write_line(first_line)
         await self._spoof_ok(writer)
         self._reset_idle_timeout()
 

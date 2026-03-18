@@ -32,8 +32,8 @@ _BASE_PORT = 19950
 def _make_job_cfg(jobs_dir: Path) -> JobConfig:
     return JobConfig(
         storage_dir=str(jobs_dir),
-        start_marker="; PROXY_JOB_START",
-        end_marker="; PROXY_JOB_END",
+        start_marker="G4 P0.0",
+        end_marker="G4 P0.0",
         auto_detect=AutoDetectConfig(
             enabled=True, line_burst=5, window_ms=300, motion_ratio=0.8
         ),
@@ -61,7 +61,7 @@ async def _enter_buffering(
     reader: asyncio.StreamReader, writer: asyncio.StreamWriter
 ) -> None:
     """Send the start marker and consume the spoofed ok."""
-    writer.write(b"; PROXY_JOB_START\n")
+    writer.write(b"G4 P0.0\n")
     await writer.drain()
     await asyncio.wait_for(reader.readline(), timeout=2.0)
 
@@ -398,7 +398,7 @@ class TestBufferingMode:
             await writer.drain()
             await asyncio.wait_for(reader.readline(), timeout=2.0)
 
-            writer.write(b"; PROXY_JOB_END\n")
+            writer.write(b"G4 P0.0\n")
             await writer.drain()
             # Brief wait for finalization
             await asyncio.sleep(0.1)
@@ -546,7 +546,7 @@ class TestHeuristicTrigger:
 
         The heuristic auto-detect is disabled by default because framing in
         LightBurn produces the same burst pattern as a real job start, making it
-        unreliable. Only the explicit ; PROXY_JOB_START marker triggers buffering.
+        unreliable. Only the explicit G4 P0.0 marker triggers buffering.
         """
         server, mock, core = _make_server(_BASE_PORT + 14, tmp_path / "jobs")
         await server.start()
@@ -594,6 +594,28 @@ class TestHeuristicTrigger:
             await writer.wait_closed()
         finally:
             await server.stop()
+
+    async def test_marker_normalization(self, tmp_path):
+        """G-code marker matching is case- and whitespace-insensitive.
+
+        LightBurn may send 'g4 p0.0' or 'G04 P0.0' — all should trigger buffering.
+        """
+        for variant, port_offset in [(b"g4 p0.0\n", 17), (b"G04 P0.0\n", 18)]:
+            server, mock, core = _make_server(
+                _BASE_PORT + port_offset, tmp_path / f"jobs{port_offset}"
+            )
+            await server.start()
+            try:
+                reader, writer = await _connect(_BASE_PORT + port_offset)
+                writer.write(variant)
+                await writer.drain()
+                await asyncio.wait_for(reader.readline(), timeout=2.0)
+                await asyncio.sleep(0.05)
+                assert core.state == ProxyState.BUFFERING, f"{variant!r} did not trigger buffering"
+                writer.close()
+                await writer.wait_closed()
+            finally:
+                await server.stop()
 
 
 # ---------------------------------------------------------------------------
