@@ -152,11 +152,20 @@ class SerialConnection:
                         "Attempting serial reconnect to %s ...", self._port
                     )
                     try:
-                        await asyncio.to_thread(self._open_port)
+                        await asyncio.wait_for(
+                            asyncio.to_thread(self._open_port),
+                            timeout=self._config.reconnect_interval - 0.5,
+                        )
                         self._connected.set()
                         logger.info("Serial reconnected to %s", self._port)
                     except SerialDisconnectedError:
                         pass  # will retry after interval
+                    except asyncio.TimeoutError:
+                        logger.debug("Serial open timed out, will retry")
+                else:
+                    logger.info(
+                        "Waiting for %s to appear ...", self._port
+                    )
 
             await asyncio.sleep(self._config.reconnect_interval)
 
