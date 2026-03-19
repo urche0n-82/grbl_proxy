@@ -120,6 +120,14 @@ class TcpServer:
         if self._proxy is not None:
             await self._proxy.on_client_disconnected()
 
+        # Close the writer so LightBurn sees a clean TCP disconnect rather than
+        # a half-open connection, allowing it to reconnect immediately.
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
         logger.info("TCP client disconnected: %s", peer)
         self._current_writer = None
         self._relay_tasks = []
