@@ -387,7 +387,7 @@ class TestBufferingMode:
         assert "?" not in sent
 
     async def test_end_marker_exits_buffering(self, tmp_path):
-        """Sending the end marker finalizes the job and exits Buffering."""
+        """Sending the end marker finalizes the job (exits Buffering → Executing or Passthrough)."""
         server, mock, core = _make_server(_BASE_PORT + 8, tmp_path / "jobs")
         await server.start()
         try:
@@ -400,10 +400,11 @@ class TestBufferingMode:
 
             writer.write(b"G4 P0.0\n")
             await writer.drain()
-            # Brief wait for finalization
+            # Brief wait for finalization; with auto-respond mock the streamer may
+            # finish immediately so state can be EXECUTING or PASSTHROUGH.
             await asyncio.sleep(0.1)
 
-            assert core.state == ProxyState.PASSTHROUGH
+            assert core.state in (ProxyState.EXECUTING, ProxyState.PASSTHROUGH)
 
             writer.close()
             await writer.wait_closed()
@@ -411,7 +412,7 @@ class TestBufferingMode:
             await server.stop()
 
     async def test_m2_finalizes_job(self, tmp_path):
-        """M2 command finalizes the buffered job."""
+        """M2 command exits Buffering and starts execution (EXECUTING or Passthrough)."""
         server, mock, core = _make_server(_BASE_PORT + 9, tmp_path / "jobs")
         await server.start()
         try:
@@ -427,7 +428,7 @@ class TestBufferingMode:
             await asyncio.wait_for(reader.readline(), timeout=2.0)  # ok for M2
             await asyncio.sleep(0.05)
 
-            assert core.state == ProxyState.PASSTHROUGH
+            assert core.state in (ProxyState.EXECUTING, ProxyState.PASSTHROUGH)
 
             writer.close()
             await writer.wait_closed()
@@ -435,7 +436,7 @@ class TestBufferingMode:
             await server.stop()
 
     async def test_m30_finalizes_job(self, tmp_path):
-        """M30 command finalizes the buffered job."""
+        """M30 command exits Buffering and starts execution (EXECUTING or Passthrough)."""
         server, mock, core = _make_server(_BASE_PORT + 10, tmp_path / "jobs")
         await server.start()
         try:
@@ -447,7 +448,7 @@ class TestBufferingMode:
             await asyncio.wait_for(reader.readline(), timeout=2.0)
             await asyncio.sleep(0.05)
 
-            assert core.state == ProxyState.PASSTHROUGH
+            assert core.state in (ProxyState.EXECUTING, ProxyState.PASSTHROUGH)
 
             writer.close()
             await writer.wait_closed()
@@ -455,7 +456,7 @@ class TestBufferingMode:
             await server.stop()
 
     async def test_idle_timeout_finalizes_job(self, tmp_path):
-        """No new lines for idle_timeout_s → job finalized."""
+        """No new lines for idle_timeout_s → job exits Buffering (EXECUTING or Passthrough)."""
         server, mock, core = _make_server(
             _BASE_PORT + 11, tmp_path / "jobs", idle_timeout_s=0.1
         )
@@ -471,7 +472,7 @@ class TestBufferingMode:
             # Wait longer than idle_timeout_s (0.1s)
             await asyncio.sleep(0.35)
 
-            assert core.state == ProxyState.PASSTHROUGH
+            assert core.state in (ProxyState.EXECUTING, ProxyState.PASSTHROUGH)
 
             writer.close()
             await writer.wait_closed()

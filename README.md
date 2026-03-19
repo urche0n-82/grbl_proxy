@@ -92,10 +92,12 @@ You should get a GRBL status response like `<Idle|MPos:0.000,0.000,0.000|FS:0,0>
 6. Work area: `400 × 415 mm` (adjust for your machine)
 7. Click **Finish**
 
-To enable disconnect-safe job buffering (Phase 2+), add these to the device's G-code preamble/postamble:
+To enable disconnect-safe job buffering (Phase 2+), add these under **Edit → Device Settings → Additional Settings**:
 
-- **Start G-code**: `; PROXY_JOB_START`
-- **End G-code**: `; PROXY_JOB_END`
+- **Start G-code**: `G4 P0.0`
+- **End G-code**: `G4 P0.0`
+
+The proxy uses this dwell command as a job boundary marker. It is harmless to GRBL and does not move the laser.
 
 ## Development
 
@@ -114,7 +116,7 @@ pytest
 All tests run without hardware using an in-process GRBL mock — no serial port required.
 
 ```
-35 passed in 0.22s
+99 passed in 3.18s
 ```
 
 ### CLI options
@@ -141,10 +143,15 @@ grbl-proxy/
 │   ├── config.py         # YAML config loading
 │   ├── serial_conn.py    # Serial port management + auto-reconnect
 │   ├── grbl_protocol.py  # GRBL 1.1 message parser
-│   └── tcp_server.py     # TCP server + bidirectional relay
+│   ├── tcp_server.py     # TCP server + bidirectional relay
+│   ├── proxy_core.py     # State machine: Passthrough/Buffering/Executing/Paused/Error
+│   ├── job_buffer.py     # Disk-based G-code buffer
+│   └── streamer.py       # Character-counting GRBL streamer
 ├── tests/
 │   ├── mock_grbl.py      # In-process GRBL mock for testing
-│   └── test_phase1.py    # Test suite (no hardware needed)
+│   ├── test_phase1.py    # Passthrough relay tests
+│   ├── test_phase2.py    # Job detection and buffering tests
+│   └── test_phase3.py    # Streamer and execution tests
 ├── systemd/
 │   └── grbl-proxy.service
 └── config.yaml.example
@@ -169,11 +176,49 @@ The reconnect loop will restore the connection automatically within `serial.reco
 
 ## Roadmap
 
-- **Phase 1** ✅ — Transparent TCP↔serial passthrough relay
-- **Phase 2** — Job detection and disk-based buffering
-- **Phase 3** — Character-counting GRBL streamer (disconnect-safe execution)
-- **Phase 4** — Web dashboard with real-time progress and pause/resume/cancel
-- **Phase 5** — Polish: alarm recovery, job history, webcam integration
+### Phase 1 ✅ — Transparent passthrough relay
+
+All LightBurn commands pass through to GRBL unmodified and all GRBL responses flow back. Jogging, homing, framing, laser framing, and console commands work exactly as if LightBurn were connected directly. Serial reconnect runs in the background — if the USB cable drops, the proxy reconnects automatically and LightBurn never notices. A single TCP client is enforced: if LightBurn reconnects, the previous socket is cleanly replaced.
+
+### Phase 2 ✅ — Job detection and disk buffering
+
+When LightBurn starts a job, the proxy intercepts the G-code stream and writes it to a file on disk before any line reaches the laser. Job boundaries are identified by a configurable start marker (default `G4 P0.0`) sent from LightBurn's device start G-code, and an end marker or terminal G-code command (`M2`/`M30`). While buffering, every LightBurn line gets a synthetic `ok` reply so LightBurn's internal send queue drains normally. Status queries (`?`) return a synthetic `<Run|...>` response so LightBurn displays a running job. If LightBurn disconnects mid-buffer, the incomplete file is discarded. An idle timeout finalises the buffer if the end marker never arrives.
+
+**LightBurn device setup for Phase 2:**
+Add these to the device's G-code start/end sequence under **Edit → Device Settings → Additional Settings**:
+- **Start G-code**: `G4 P0.0`
+- **End G-code**: `G4 P0.0`
+
+### Phase 3 ✅ — Character-counting GRBL streamer (disconnect-safe execution)
+
+Once a job is fully buffered, the proxy takes ownership of the serial port and streams the G-code file directly to GRBL using the character-counting flow-control protocol (GRBL's 128-byte RX buffer). LightBurn plays no further role in execution — the job runs to completion whether or not LightBurn stays connected.
+
+**Behaviour during execution:**
+- LightBurn can disconnect and reconnect freely — the job is unaffected.
+- Status queries (`?`) return a synthetic `<Run|...>` response derived from the last known machine position.
+- Interactive commands (`$$`, jog moves, etc.) are rejected with `error:9` (busy).
+- Feed hold (`!`) pauses the streamer; cycle resume (`~`) continues it. Both are forwarded to GRBL.
+- Soft reset (`Ctrl-X`) cancels the job and transitions to Error state.
+- On a GRBL `error:N` or `ALARM:N` response, execution stops and the proxy enters Error state.
+- In Error state all commands are rejected with `error:9` until the operator sends `$X` (alarm clear) or `$H` (re-home), which forwards the command to GRBL and returns the proxy to Passthrough.
+- On successful completion the proxy returns silently to Passthrough, ready for the next job.
+
+### Phase 4 — Web dashboard _(planned)_
+
+A lightweight browser UI served from the Pi, providing:
+
+- Live machine state, position, feed rate, and job progress (lines sent / total)
+- Pause, resume, and cancel controls that work independently of LightBurn
+- REST API (`/api/status`, `/api/job`, `/api/job/pause`, `/api/job/resume`, `/api/job/cancel`, `/api/console`)
+- Ability to upload a G-code file and start a job directly without LightBurn
+- Recent console log (last N GRBL messages)
+
+### Phase 5 — Polish and observability _(planned)_
+
+- Job history: completed job log with filename, duration, line count, and outcome
+- Alarm recovery workflow: guided `$X` / `$H` from the dashboard after a fault
+- Webcam integration: optional MJPEG stream from a Pi camera or USB webcam embedded in the dashboard
+- Proxy configuration UI: edit `config.yaml` settings from the browser
 
 ## License
 

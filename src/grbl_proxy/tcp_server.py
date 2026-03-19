@@ -73,6 +73,8 @@ class TcpServer:
     async def stop(self) -> None:
         """Stop the server and drop any active connection."""
         await self._drop_current_client("server stopping")
+        if self._proxy is not None:
+            await self._proxy.shutdown()
         if self._server:
             self._server.close()
             await self._server.wait_closed()
@@ -260,6 +262,14 @@ class TcpServer:
         """Forward lines from GRBL (serial) back to LightBurn (TCP)."""
         serial_was_connected = self._serial.is_connected
         while not stop_relay.is_set():
+            # During EXECUTING the GrblStreamer owns the serial read path.
+            # Wait here until the streamer releases it (serial_readable is set).
+            if self._proxy is not None and not self._proxy.serial_readable.is_set():
+                await self._proxy.serial_readable.wait()
+                if stop_relay.is_set():
+                    break
+                continue
+
             # Race read_line() against stop_relay so _serial_to_tcp wakes up
             # promptly when the TCP side closes, rather than blocking until the
             # next 1-second serial readline timeout tick.

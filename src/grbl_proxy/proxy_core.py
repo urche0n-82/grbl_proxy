@@ -16,11 +16,15 @@ import re
 import time
 from collections import deque
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from grbl_proxy import grbl_protocol
 from grbl_proxy.config import AutoDetectConfig, JobConfig
 from grbl_proxy.grbl_protocol import StatusReport
-from grbl_proxy.job_buffer import JobBuffer
+from grbl_proxy.job_buffer import JobBuffer, JobMetadata
+
+if TYPE_CHECKING:
+    from grbl_proxy.streamer import GrblStreamer, StreamerResult
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +38,9 @@ class ProxyState(enum.Enum):
     DISCONNECTED = "Disconnected"
     PASSTHROUGH = "Passthrough"
     BUFFERING = "Buffering"
-    # EXECUTING and PAUSED added in Phase 3
+    EXECUTING = "Executing"  # streaming buffered job to GRBL
+    PAUSED = "Paused"        # feed hold during execution
+    ERROR = "Error"          # streamer stopped due to GRBL error/alarm or cancel
 
 
 # ---------------------------------------------------------------------------
@@ -116,12 +122,19 @@ class ProxyCore:
         self._state = ProxyState.DISCONNECTED
         self._buffer: JobBuffer | None = None
         self._last_status: StatusReport | None = None
+        self._last_error: StreamerResult | None = None
         self._idle_handle: asyncio.TimerHandle | None = None
         self._detector = (
             _HeuristicDetector(job_cfg.auto_detect)
             if job_cfg.auto_detect.enabled
             else None
         )
+        # Phase 3: streamer integration
+        self._serial_conn = None  # cached from first process_raw_byte call
+        self._streamer: GrblStreamer | None = None
+        self._streamer_task: asyncio.Task | None = None
+        self._serial_readable = asyncio.Event()
+        self._serial_readable.set()  # readable by default; cleared during EXECUTING
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -133,6 +146,14 @@ class ProxyCore:
             # Fire-and-forget discard — we can't await here
             asyncio.ensure_future(self._buffer.discard())
             self._buffer = None
+        # During EXECUTING/PAUSED/ERROR: job continues (or stays in error state).
+        # Allow reconnect without resetting — LightBurn gets synthetic status.
+        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED, ProxyState.ERROR):
+            logger.info(
+                "ProxyCore: client reconnected during %s — job continues",
+                self._state.value,
+            )
+            return
         self._cancel_idle_timeout()
         self._state = ProxyState.PASSTHROUGH
         if self._detector:
@@ -147,6 +168,17 @@ class ProxyCore:
             logger.warning("TCP dropped mid-buffer — discarding incomplete job")
             await self._buffer.discard()
             self._buffer = None
+        # EXECUTING/PAUSED: disconnect-safe — job continues without LightBurn.
+        # State stays EXECUTING/PAUSED; _on_streamer_done handles the transition.
+        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
+            logger.info(
+                "ProxyCore: client disconnected during %s — job execution continues",
+                self._state.value,
+            )
+            self._cancel_idle_timeout()
+            if self._detector:
+                self._detector.reset()
+            return
         self._cancel_idle_timeout()
         self._state = ProxyState.DISCONNECTED
         if self._detector:
@@ -168,12 +200,24 @@ class ProxyCore:
         Returns True if the byte was consumed and should NOT be added to the
         line buffer. Must be called for every incoming byte.
         """
+        # Cache serial_conn reference for use by the streamer
+        self._serial_conn = serial_conn
+
         if not grbl_protocol.is_realtime_command(byte):
             return False
 
         if byte == ord("?"):
-            if self._state == ProxyState.BUFFERING:
+            if self._state in (
+                ProxyState.BUFFERING,
+                ProxyState.EXECUTING,
+                ProxyState.PAUSED,
+            ):
                 await self._write_synthetic_status(writer)
+            elif self._state == ProxyState.ERROR:
+                # Report alarm state so LightBurn shows the machine as alarmed
+                response = grbl_protocol.make_status_response(state="Alarm")
+                writer.write(response.encode())
+                await writer.drain()
             else:
                 # Passthrough: forward to serial
                 try:
@@ -199,7 +243,40 @@ class ProxyCore:
             self._state = ProxyState.PASSTHROUGH
             if self._detector:
                 self._detector.reset()
-        # Forward the command to serial regardless
+
+        # Feed hold during EXECUTING — pause the streamer
+        if self._state == ProxyState.EXECUTING and byte == ord("!"):
+            if self._streamer is not None:
+                self._streamer.pause()
+            self._state = ProxyState.PAUSED
+            try:
+                await serial_conn.write(bytes([byte]))
+            except Exception as e:
+                logger.debug("Serial write error for feed hold: %s", e)
+            return True
+
+        # Cycle resume during PAUSED — resume the streamer
+        if self._state == ProxyState.PAUSED and byte == ord("~"):
+            if self._streamer is not None:
+                self._streamer.resume()
+            self._state = ProxyState.EXECUTING
+            try:
+                await serial_conn.write(bytes([byte]))
+            except Exception as e:
+                logger.debug("Serial write error for cycle resume: %s", e)
+            return True
+
+        # Soft reset during EXECUTING/PAUSED — cancel job
+        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED) and byte == 0x18:
+            if self._streamer is not None:
+                self._streamer.cancel()
+            try:
+                await serial_conn.write(bytes([byte]))
+            except Exception as e:
+                logger.debug("Serial write error for soft reset: %s", e)
+            return True
+
+        # Forward the command to serial regardless (BUFFERING path, PASSTHROUGH, etc.)
         try:
             await serial_conn.write(bytes([byte]))
         except Exception as e:
@@ -229,6 +306,30 @@ class ProxyCore:
                 except Exception as e:
                     logger.debug("Serial write error in passthrough: %s", e)
                     raise
+
+        elif self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
+            # Job is running — reject interactive commands with error:9 (busy)
+            logger.debug("Command rejected during %s: %s", self._state.value, line)
+            writer.write(b"error:9\n")
+            await writer.drain()
+
+        elif self._state == ProxyState.ERROR:
+            # Blocked until operator clears the error with $X or $H
+            upper = line.strip().upper()
+            if upper in ("$X", "$H"):
+                logger.info("Error cleared via %s — returning to Passthrough", upper)
+                try:
+                    await serial_conn.write((line + "\n").encode())
+                except Exception as e:
+                    logger.debug("Serial write error for error clear: %s", e)
+                self._state = ProxyState.PASSTHROUGH
+                self._last_error = None
+                writer.write(b"ok\n")
+                await writer.drain()
+            else:
+                logger.debug("Command rejected in ERROR state: %s", line)
+                writer.write(b"error:9\n")
+                await writer.drain()
 
         elif self._state == ProxyState.BUFFERING:
             # Check for end marker first (don't write the marker line itself
@@ -266,6 +367,93 @@ class ProxyCore:
     def state(self) -> ProxyState:
         return self._state
 
+    @property
+    def serial_readable(self) -> asyncio.Event:
+        """Event that is set when _serial_to_tcp may read from serial.
+
+        Cleared during EXECUTING — the GrblStreamer owns the serial read path.
+        Re-set when the streamer finishes or is cancelled.
+        """
+        return self._serial_readable
+
+    # ------------------------------------------------------------------
+    # Phase 3: Streamer lifecycle
+    # ------------------------------------------------------------------
+
+    def _start_streamer(self, meta: JobMetadata) -> None:
+        """Create and launch the GrblStreamer task."""
+        from grbl_proxy.streamer import GrblStreamer  # lazy import avoids circular
+
+        if self._serial_conn is None:
+            # No serial connection cached — cannot execute. Fall back to passthrough.
+            logger.error(
+                "Cannot start streamer: no serial connection cached. "
+                "Returning to Passthrough."
+            )
+            self._state = ProxyState.PASSTHROUGH
+            self._serial_readable.set()
+            return
+
+        logger.info(
+            "Job buffered: %d lines, %.1fs elapsed → %s — starting execution",
+            meta.line_count,
+            meta.duration_s,
+            meta.path,
+        )
+        self._streamer = GrblStreamer(
+            gcode_path=meta.path,
+            serial_conn=self._serial_conn,
+            on_done=self._on_streamer_done,
+            on_status=self.update_last_status,
+        )
+        self._streamer_task = asyncio.create_task(
+            self._streamer.run(), name="grbl-streamer"
+        )
+
+    def _on_streamer_done(self, result: StreamerResult) -> None:
+        """Synchronous callback from GrblStreamer when streaming finishes."""
+        self._streamer = None
+        self._streamer_task = None
+        self._serial_readable.set()  # restore serial to _serial_to_tcp
+
+        if result.completed:
+            logger.info(
+                "Streaming complete: %d/%d lines sent",
+                result.lines_sent,
+                result.total_lines,
+            )
+            if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
+                self._state = ProxyState.PASSTHROUGH
+        else:
+            if result.alarm_code is not None:
+                logger.error(
+                    "GRBL ALARM:%d — proxy in ERROR state. Send $X or $H to clear.",
+                    result.alarm_code,
+                )
+            elif result.error_code is not None:
+                logger.error(
+                    "GRBL error:%d at line %d — proxy in ERROR state.",
+                    result.error_code,
+                    result.error_line,
+                )
+            else:
+                logger.warning(
+                    "Job cancelled after %d lines — proxy in ERROR state.",
+                    result.lines_sent,
+                )
+            self._last_error = result
+            if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
+                self._state = ProxyState.ERROR
+
+    async def shutdown(self) -> None:
+        """Cancel streamer task cleanly. Called by TcpServer.stop()."""
+        if self._streamer_task is not None and not self._streamer_task.done():
+            self._streamer_task.cancel()
+            await asyncio.gather(self._streamer_task, return_exceptions=True)
+        self._streamer = None
+        self._streamer_task = None
+        self._serial_readable.set()
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -295,36 +483,33 @@ class ProxyCore:
         self._reset_idle_timeout()
 
     async def _finalize_job(self, last_line: str | None = None) -> None:
-        """Flush, close, and log the completed job buffer."""
+        """Flush, close, and start execution of the completed job buffer."""
         if self._buffer is None:
             return
         self._cancel_idle_timeout()
         if last_line is not None:
             await self._buffer.write_line(last_line)
         # Ensure M2 is always the final line so the buffered file is a
-        # self-contained executable G-code program for Phase 3 replay.
+        # self-contained executable G-code program.
         if not is_program_end_command(last_line or ""):
             await self._buffer.write_line("M2")
         meta = await self._buffer.finalize()
         self._buffer = None
-        self._state = ProxyState.PASSTHROUGH  # Phase 3: change to EXECUTING
-        logger.info(
-            "Job buffered: %d lines, %.1fs elapsed → %s  (Phase 3 will execute)",
-            meta.line_count,
-            meta.duration_s,
-            meta.path,
-        )
+        self._state = ProxyState.EXECUTING
+        self._serial_readable.clear()  # streamer now owns serial reads
+        self._start_streamer(meta)
 
     async def _write_synthetic_status(self, writer: asyncio.StreamWriter) -> None:
-        """Respond to a '?' query with a synthesized Run status."""
+        """Respond to a '?' query with a synthesized status based on current state."""
+        grbl_state = "Hold" if self._state == ProxyState.PAUSED else "Run"
         if self._last_status is not None:
             mpos = self._last_status.get("mpos", (0.0, 0.0, 0.0))
             fs = self._last_status.get("fs", (0, 0))
             response = grbl_protocol.make_status_response(
-                state="Run", mpos=mpos, feed=fs[0], spindle=fs[1]
+                state=grbl_state, mpos=mpos, feed=fs[0], spindle=fs[1]
             )
         else:
-            response = grbl_protocol.make_status_response(state="Run")
+            response = grbl_protocol.make_status_response(state=grbl_state)
         writer.write(response.encode())
         await writer.drain()
 
