@@ -274,8 +274,13 @@ class TcpServer:
             try:
                 line = read_task.result()
             except SerialDisconnectedError as e:
+                if not self._serial.is_connected:
+                    # Serial not yet available — wait quietly for reconnect loop
+                    # to restore it rather than alarming LightBurn with error:9.
+                    await asyncio.sleep(0.5)
+                    continue
                 logger.warning("Serial disconnected during relay: %s", e)
-                # Notify LightBurn that the machine is unavailable
+                # Serial was connected and dropped mid-relay — notify LightBurn.
                 try:
                     writer.write(b"error:9\n")
                     await writer.drain()

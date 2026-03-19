@@ -37,6 +37,10 @@ class MockSerialConnection:
     def close_immediately(self) -> None:
         self._connected = False
 
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
     async def read_line(self) -> str:
         """Block until a line is available in the receive queue."""
         return await self._rx_queue.get()
