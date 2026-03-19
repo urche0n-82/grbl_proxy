@@ -203,13 +203,26 @@ class TcpServer:
 
                 logger.debug("TCP→Serial: %r", data)
 
+                if not self._serial.is_connected:
+                    # Serial unavailable — respond to each incoming line with
+                    # error:9 so LightBurn stops sending and shows alarm state.
+                    writer = self._current_writer
+                    if writer is not None:
+                        lines = data.count(b'\n')
+                        if lines:
+                            try:
+                                writer.write(b"error:9\n" * lines)
+                                await writer.drain()
+                            except (BrokenPipeError, ConnectionResetError):
+                                break
+                    continue
+
                 if self._proxy is None:
                     # Phase 1 passthrough: raw byte forwarding
                     try:
                         await self._serial.write(data)
                     except SerialDisconnectedError as e:
                         logger.warning("Serial unavailable during TCP→Serial relay: %s", e)
-                        # Keep reading from TCP; reconnect loop will restore serial
                 else:
                     # Phase 2+: route through ProxyCore
                     writer = self._current_writer
@@ -275,20 +288,21 @@ class TcpServer:
             try:
                 line = read_task.result()
             except SerialDisconnectedError as e:
-                if not serial_was_connected:
-                    # Serial not yet available — wait quietly for reconnect loop
-                    # to restore it rather than alarming LightBurn with error:9.
-                    await asyncio.sleep(0.5)
+                if serial_was_connected:
+                    logger.warning("Serial disconnected during relay: %s", e)
+                    # Serial dropped mid-relay — notify LightBurn with an alarm.
+                    try:
+                        writer.write(b"error:9\n")
+                        await writer.drain()
+                    except (BrokenPipeError, ConnectionResetError):
+                        pass
+                    stop_relay.set()
+                    break
+                else:
+                    # Serial not yet available — pause before retrying so
+                    # LightBurn's reconnect attempts don't spin at full speed.
+                    await asyncio.sleep(1.0)
                     continue
-                logger.warning("Serial disconnected during relay: %s", e)
-                # Serial was connected and dropped mid-relay — notify LightBurn.
-                try:
-                    writer.write(b"error:9\n")
-                    await writer.drain()
-                except (BrokenPipeError, ConnectionResetError):
-                    pass
-                stop_relay.set()
-                break
 
             if not line:
                 # Timeout tick from read_line — no data, keep looping
