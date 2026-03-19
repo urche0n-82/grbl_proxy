@@ -230,6 +230,7 @@ class TcpServer:
             except asyncio.CancelledError:
                 read_task.cancel()
                 stop_task.cancel()
+                self._serial.close_immediately()
                 raise
             finally:
                 stop_task.cancel()
@@ -237,6 +238,9 @@ class TcpServer:
             if stop_relay.is_set():
                 logger.debug("_serial_to_tcp: stop_relay set, exiting")
                 read_task.cancel()
+                # Close the port immediately so the readline thread unblocks
+                # rather than waiting up to READLINE_TIMEOUT for it to return.
+                self._serial.close_immediately()
                 break
 
             try:

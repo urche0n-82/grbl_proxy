@@ -301,6 +301,10 @@ class ProxyCore:
         self._cancel_idle_timeout()
         if last_line is not None:
             await self._buffer.write_line(last_line)
+        # Ensure M2 is always the final line so the buffered file is a
+        # self-contained executable G-code program for Phase 3 replay.
+        if not is_program_end_command(last_line or ""):
+            await self._buffer.write_line("M2")
         meta = await self._buffer.finalize()
         self._buffer = None
         self._state = ProxyState.PASSTHROUGH  # Phase 3: change to EXECUTING

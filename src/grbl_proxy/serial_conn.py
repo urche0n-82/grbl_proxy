@@ -64,11 +64,23 @@ class SerialConnection:
     async def disconnect(self) -> None:
         """Close the serial port cleanly."""
         self._shutting_down = True
-        self._connected.clear()
+        self.close_immediately()
+
+    def close_immediately(self) -> None:
+        """Close the serial port synchronously from any thread or coroutine.
+
+        Yanks the underlying file descriptor so any thread blocked in
+        readline() unblocks immediately with an exception. Safe to call
+        concurrently — idempotent if already closed.
+        """
         s = self._serial
         self._serial = None
+        self._connected.clear()
         if s is not None:
-            await asyncio.to_thread(s.close)
+            try:
+                s.close()
+            except Exception:
+                pass
 
     async def read_line(self) -> str:
         """Read one newline-terminated line from the serial port.
@@ -80,15 +92,16 @@ class SerialConnection:
         if self._serial is None:
             raise SerialDisconnectedError("Serial port not open")
 
+        s = self._serial  # snapshot — may be set to None by close_immediately()
         try:
-            raw = await asyncio.to_thread(self._serial.readline)
+            raw = await asyncio.to_thread(s.readline)
         except serial.SerialException as e:
             logger.warning("Serial read error: %s", e)
-            self._connected.clear()
+            self.close_immediately()
             raise SerialDisconnectedError(str(e)) from e
         except OSError as e:
             logger.warning("Serial OS error on read: %s", e)
-            self._connected.clear()
+            self.close_immediately()
             raise SerialDisconnectedError(str(e)) from e
 
         if not raw:
