@@ -89,10 +89,15 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
     # Signal reconnect loop to stop before cancelling — this lets the while-loop
     # condition exit cleanly and prevents the default executor from blocking on
     # a serial.Serial() call in a background thread after the task is cancelled.
+    logger.info("Shutdown: signalling serial connection")
     serial_conn.signal_shutdown()
+    logger.info("Shutdown: cancelling reconnect task")
     reconnect_task.cancel()
+    logger.info("Shutdown: waiting for reconnect task")
     await asyncio.gather(reconnect_task, return_exceptions=True)
+    logger.info("Shutdown: stopping TCP server")
     await tcp_server.stop()
+    logger.info("Shutdown: disconnecting serial")
     await serial_conn.disconnect()
 
     logger.info("grbl-proxy stopped.")
