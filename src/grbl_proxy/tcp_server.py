@@ -245,6 +245,7 @@ class TcpServer:
         self, writer: asyncio.StreamWriter, stop_relay: asyncio.Event
     ) -> None:
         """Forward lines from GRBL (serial) back to LightBurn (TCP)."""
+        serial_was_connected = self._serial.is_connected
         while not stop_relay.is_set():
             # Race read_line() against stop_relay so _serial_to_tcp wakes up
             # promptly when the TCP side closes, rather than blocking until the
@@ -274,7 +275,7 @@ class TcpServer:
             try:
                 line = read_task.result()
             except SerialDisconnectedError as e:
-                if not self._serial.is_connected:
+                if not serial_was_connected:
                     # Serial not yet available — wait quietly for reconnect loop
                     # to restore it rather than alarming LightBurn with error:9.
                     await asyncio.sleep(0.5)
@@ -291,7 +292,10 @@ class TcpServer:
 
             if not line:
                 # Timeout tick from read_line — no data, keep looping
+                serial_was_connected = True  # read succeeded, serial is live
                 continue
+
+            serial_was_connected = True  # successful read confirms serial is live
 
             # Snoop on status reports: log and cache for synthetic responses
             if grbl_protocol.is_status_report(line):
