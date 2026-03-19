@@ -160,8 +160,28 @@ class TcpServer:
             logger.debug("_tcp_to_serial: task started, stop_relay=%s", stop_relay.is_set())
             while not stop_relay.is_set():
                 logger.debug("_tcp_to_serial: waiting for data (stop_relay=%s)", stop_relay.is_set())
+                # Race TCP read against stop_relay so this task wakes promptly
+                # when serial disconnects (stop_relay set by _serial_to_tcp),
+                # rather than blocking until LightBurn sends more data.
+                read_task = asyncio.create_task(reader.read(256))
+                stop_task = asyncio.create_task(stop_relay.wait())
                 try:
-                    data = await reader.read(256)
+                    await asyncio.wait(
+                        [read_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+                    )
+                except asyncio.CancelledError:
+                    read_task.cancel()
+                    stop_task.cancel()
+                    raise
+                finally:
+                    stop_task.cancel()
+
+                if stop_relay.is_set():
+                    read_task.cancel()
+                    break
+
+                try:
+                    data = read_task.result()
                 except (ConnectionResetError, BrokenPipeError) as e:
                     logger.debug("TCP read error: %s", e)
                     break
