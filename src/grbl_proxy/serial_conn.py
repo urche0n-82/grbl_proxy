@@ -163,7 +163,7 @@ class SerialConnection:
                     except asyncio.TimeoutError:
                         logger.debug("Serial open timed out, will retry")
                 else:
-                    logger.info(
+                    logger.debug(
                         "Waiting for %s to appear ...", self._port
                     )
 
