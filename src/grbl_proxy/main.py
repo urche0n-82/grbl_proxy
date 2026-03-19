@@ -71,7 +71,11 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
         await serial_conn.disconnect()
         return
 
-    # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C)
+    # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C).
+    # SIGTERM uses loop.add_signal_handler (no default behaviour to preserve).
+    # SIGINT is left as default so KeyboardInterrupt propagates through the
+    # event loop normally — add_signal_handler suppresses it and can miss
+    # signals when a thread holds the GIL (e.g. blocking serial.Serial()).
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
 
@@ -79,16 +83,16 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
         logger.info("Received %s, shutting down...", sig_name)
         stop_event.set()
 
-    for sig, name in ((signal.SIGTERM, "SIGTERM"), (signal.SIGINT, "SIGINT")):
-        loop.add_signal_handler(sig, _request_stop, name)
+    loop.add_signal_handler(signal.SIGTERM, _request_stop, "SIGTERM")
 
     logger.info("grbl-proxy running. Press Ctrl-C to stop.")
 
-    await stop_event.wait()
+    try:
+        await stop_event.wait()
+    except (asyncio.CancelledError, KeyboardInterrupt):
+        pass
 
-    # Signal reconnect loop to stop before cancelling — this lets the while-loop
-    # condition exit cleanly and prevents the default executor from blocking on
-    # a serial.Serial() call in a background thread after the task is cancelled.
+    logger.info("Shutting down...")
     logger.info("Shutdown: signalling serial connection")
     serial_conn.signal_shutdown()
     logger.info("Shutdown: cancelling reconnect task")
