@@ -300,7 +300,11 @@ class TcpServer:
                 stop_task.cancel()
                 if yield_task is not None:
                     yield_task.cancel()
-                self._serial.close_immediately()
+                # Only close serial if we own the read path. During
+                # EXECUTING/PAUSED the streamer owns it — closing here
+                # would kill the actively streaming job.
+                if self._proxy is None or self._proxy.serial_readable.is_set():
+                    self._serial.close_immediately()
                 raise
             finally:
                 stop_task.cancel()
@@ -323,8 +327,10 @@ class TcpServer:
                 logger.debug("_serial_to_tcp: stop_relay set, exiting")
                 read_task.cancel()
                 # Close the port immediately so the readline thread unblocks
-                # rather than waiting up to READLINE_TIMEOUT for it to return.
-                self._serial.close_immediately()
+                # — but only if we own the read path. During EXECUTING/PAUSED
+                # the streamer owns serial; closing it would kill the job.
+                if self._proxy is None or self._proxy.serial_readable.is_set():
+                    self._serial.close_immediately()
                 break
 
             # Signal idle now that the read has completed

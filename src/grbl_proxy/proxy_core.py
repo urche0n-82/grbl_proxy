@@ -312,10 +312,10 @@ class ProxyCore:
                     raise
 
         elif self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
-            # Job is running — reject interactive commands with error:9 (busy)
-            logger.debug("Command rejected during %s: %s", self._state.value, line)
-            writer.write(b"error:9\n")
-            await writer.drain()
+            # Job is running — silently accept commands so LightBurn's
+            # reconnect handshake ($I, $#, $H) doesn't trigger alarm state.
+            logger.debug("Command swallowed during %s: %s", self._state.value, line)
+            await self._spoof_ok(writer)
 
         elif self._state == ProxyState.ERROR:
             # Blocked until operator clears the error with $X or $H

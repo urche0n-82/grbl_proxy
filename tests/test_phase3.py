@@ -468,7 +468,7 @@ class TestProxyCoreExecuting:
             writer.write(b"G0 X50\n")
             await writer.drain()
             resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            assert resp == b"error:9\n"
+            assert resp == b"ok\n"
 
             # Finish
             for _ in range(5):
@@ -609,10 +609,10 @@ class TestStreamerIntegration:
             await self._buffer_and_hold_executing(mock, reader, writer, core)
             assert core.state == ProxyState.EXECUTING
 
-            writer.write(b"$$\n")  # settings query — should be rejected
+            writer.write(b"$$\n")  # settings query — swallowed with ok
             await writer.drain()
             resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            assert resp == b"error:9\n"
+            assert resp == b"ok\n"
 
             for _ in range(5):
                 mock.inject("ok")
