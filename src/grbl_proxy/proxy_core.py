@@ -159,6 +159,7 @@ class ProxyCore:
             )
             return
         self._job_just_completed = False
+        self._serial_readable.set()  # ensure gate is open for fresh connection
         self._cancel_idle_timeout()
         self._state = ProxyState.PASSTHROUGH
         if self._detector:
