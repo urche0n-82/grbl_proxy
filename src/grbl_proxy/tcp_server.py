@@ -265,7 +265,9 @@ class TcpServer:
             # During EXECUTING the GrblStreamer owns the serial read path.
             # Wait here until the streamer releases it (serial_readable is set).
             if self._proxy is not None and not self._proxy.serial_readable.is_set():
+                logger.debug("_serial_to_tcp: waiting for serial_readable (state=%s)", self._proxy.state.value)
                 await self._proxy.serial_readable.wait()
+                logger.debug("_serial_to_tcp: serial_readable set, resuming (state=%s)", self._proxy.state.value)
                 if stop_relay.is_set():
                     break
                 continue
