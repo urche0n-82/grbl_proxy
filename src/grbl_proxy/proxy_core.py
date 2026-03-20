@@ -135,10 +135,6 @@ class ProxyCore:
         self._streamer_task: asyncio.Task | None = None
         self._serial_readable = asyncio.Event()
         self._serial_readable.set()  # readable by default; cleared during EXECUTING
-        # Set by _on_streamer_done when a job completes; tells on_client_disconnected
-        # not to overwrite the PASSTHROUGH state with DISCONNECTED in the case
-        # where the streamer finished while the relay tasks were still winding down.
-        self._job_just_completed = False
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -158,8 +154,6 @@ class ProxyCore:
                 self._state.value,
             )
             return
-        self._job_just_completed = False
-        self._serial_readable.set()  # ensure gate is open for fresh connection
         self._cancel_idle_timeout()
         self._state = ProxyState.PASSTHROUGH
         if self._detector:
@@ -176,13 +170,9 @@ class ProxyCore:
             self._buffer = None
         # EXECUTING/PAUSED: disconnect-safe — job continues without LightBurn.
         # State stays EXECUTING/PAUSED; _on_streamer_done handles the transition.
-        #
-        # _job_just_completed: the streamer finished and set state to PASSTHROUGH
-        # while the relay tasks were still winding down. Don't overwrite with
-        # DISCONNECTED — the proxy is ready for the next connection as-is.
-        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED) or self._job_just_completed:
+        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
             logger.info(
-                "ProxyCore: client disconnected (state stays %s)",
+                "ProxyCore: client disconnected during %s — job execution continues",
                 self._state.value,
             )
             self._cancel_idle_timeout()
@@ -434,7 +424,6 @@ class ProxyCore:
             )
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
                 self._state = ProxyState.PASSTHROUGH
-                self._job_just_completed = True
         else:
             if result.alarm_code is not None:
                 logger.error(
@@ -521,12 +510,8 @@ class ProxyCore:
             )
         else:
             response = grbl_protocol.make_status_response(state=grbl_state)
-        logger.debug("Synthetic status → TCP: %r", response)
-        try:
-            writer.write(response.encode())
-            await writer.drain()
-        except (BrokenPipeError, ConnectionResetError) as e:
-            logger.debug("TCP write error sending synthetic status: %s", e)
+        writer.write(response.encode())
+        await writer.drain()
 
     @staticmethod
     async def _spoof_ok(writer: asyncio.StreamWriter) -> None:

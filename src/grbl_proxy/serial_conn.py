@@ -104,11 +104,11 @@ class SerialConnection:
             self.close_immediately()
             raise SerialDisconnectedError(str(e)) from e
 
-            if not raw:
-                # Timeout — no data within READLINE_TIMEOUT seconds, not an error
-                return ""
+        if not raw:
+            # Timeout — no data within READLINE_TIMEOUT seconds, not an error
+            return ""
 
-            return raw.decode(errors="replace").rstrip("\r\n")
+        return raw.decode(errors="replace").rstrip("\r\n")
 
     async def write(self, data: bytes) -> None:
         """Write bytes to the serial port.
@@ -163,7 +163,7 @@ class SerialConnection:
                     except asyncio.TimeoutError:
                         logger.debug("Serial open timed out, will retry")
                 else:
-                    logger.debug(
+                    logger.info(
                         "Waiting for %s to appear ...", self._port
                     )
 
