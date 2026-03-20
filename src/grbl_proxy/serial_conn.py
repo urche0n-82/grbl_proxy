@@ -41,6 +41,7 @@ class SerialConnection:
         self._port = port or config.port
         self._serial: serial.Serial | None = None
         self._write_lock = asyncio.Lock()
+        self._read_lock = asyncio.Lock()
         self._connected = asyncio.Event()
         self._shutting_down = False
 
@@ -88,27 +89,34 @@ class SerialConnection:
         Blocks (in a thread) until a complete line arrives or the 1-second
         readline timeout fires. On timeout returns an empty string. On USB
         disconnect raises SerialDisconnectedError.
+
+        A lock ensures only one caller reads at a time. This matters at the
+        BUFFERING→EXECUTING boundary: _serial_to_tcp may have a read already
+        in flight when the streamer starts. The streamer's first read_line()
+        blocks on the lock until _serial_to_tcp's thread returns (empty timeout
+        tick or a line), preventing two concurrent reads from the same fd.
         """
-        if self._serial is None:
-            raise SerialDisconnectedError("Serial port not open")
+        async with self._read_lock:
+            if self._serial is None:
+                raise SerialDisconnectedError("Serial port not open")
 
-        s = self._serial  # snapshot — may be set to None by close_immediately()
-        try:
-            raw = await asyncio.to_thread(s.readline)
-        except serial.SerialException as e:
-            logger.warning("Serial read error: %s", e)
-            self.close_immediately()
-            raise SerialDisconnectedError(str(e)) from e
-        except OSError as e:
-            logger.warning("Serial OS error on read: %s", e)
-            self.close_immediately()
-            raise SerialDisconnectedError(str(e)) from e
+            s = self._serial  # snapshot — may be set to None by close_immediately()
+            try:
+                raw = await asyncio.to_thread(s.readline)
+            except serial.SerialException as e:
+                logger.warning("Serial read error: %s", e)
+                self.close_immediately()
+                raise SerialDisconnectedError(str(e)) from e
+            except OSError as e:
+                logger.warning("Serial OS error on read: %s", e)
+                self.close_immediately()
+                raise SerialDisconnectedError(str(e)) from e
 
-        if not raw:
-            # Timeout — no data within READLINE_TIMEOUT seconds, not an error
-            return ""
+            if not raw:
+                # Timeout — no data within READLINE_TIMEOUT seconds, not an error
+                return ""
 
-        return raw.decode(errors="replace").rstrip("\r\n")
+            return raw.decode(errors="replace").rstrip("\r\n")
 
     async def write(self, data: bytes) -> None:
         """Write bytes to the serial port.

@@ -270,36 +270,22 @@ class TcpServer:
                     break
                 continue
 
-            # Race read_line() against stop_relay AND serial_yielding so that:
-            # - stop_relay: we exit promptly when the TCP side closes
-            # - serial_yielding: fires the instant _finalize_job transitions to
-            #   EXECUTING (streamer taking ownership of serial). Without this
-            #   third racer, the in-flight read_task wins the race and steals
-            #   one 'ok' from the streamer, causing its buffer accounting to
-            #   hang indefinitely.
+            # Race read_line() against stop_relay so _serial_to_tcp wakes up
+            # promptly when the TCP side closes, rather than blocking until the
+            # next 1-second serial readline timeout tick.
             read_task = asyncio.create_task(self._serial.read_line())
             stop_task = asyncio.create_task(stop_relay.wait())
-            yield_task = (
-                asyncio.create_task(self._proxy.serial_yielding.wait())
-                if self._proxy is not None
-                else None
-            )
-            wait_set = {read_task, stop_task}
-            if yield_task is not None:
-                wait_set.add(yield_task)
             try:
-                await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
+                await asyncio.wait(
+                    [read_task, stop_task], return_when=asyncio.FIRST_COMPLETED
+                )
             except asyncio.CancelledError:
                 read_task.cancel()
                 stop_task.cancel()
-                if yield_task is not None:
-                    yield_task.cancel()
                 self._serial.close_immediately()
                 raise
             finally:
                 stop_task.cancel()
-                if yield_task is not None:
-                    yield_task.cancel()
 
             if stop_relay.is_set():
                 logger.debug("_serial_to_tcp: stop_relay set, exiting")
@@ -308,12 +294,6 @@ class TcpServer:
                 # rather than waiting up to READLINE_TIMEOUT for it to return.
                 self._serial.close_immediately()
                 break
-
-            # If serial_yielding fired, the streamer just took ownership —
-            # cancel our read and loop back to the serial_readable gate.
-            if self._proxy is not None and self._proxy.serial_yielding.is_set():
-                read_task.cancel()
-                continue
 
             try:
                 line = read_task.result()
