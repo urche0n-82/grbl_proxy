@@ -545,6 +545,7 @@ class ProxyCore:
             )
         else:
             response = grbl_protocol.make_status_response(state=grbl_state)
+        logger.debug("Synthetic status → TCP: %s", response.rstrip())
         writer.write(response.encode())
         await writer.drain()
 
