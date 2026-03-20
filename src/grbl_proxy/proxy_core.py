@@ -135,6 +135,15 @@ class ProxyCore:
         self._streamer_task: asyncio.Task | None = None
         self._serial_readable = asyncio.Event()
         self._serial_readable.set()  # readable by default; cleared during EXECUTING
+        # Set by _on_streamer_done; tells on_client_disconnected not to return
+        # to DISCONNECTED when state is already PASSTHROUGH because the streamer
+        # finished while the relay tasks were still winding down.
+        self._job_just_completed = False
+        # Fires (gets set) the instant the streamer takes ownership of serial,
+        # then is cleared again once the streamer releases it.  _serial_to_tcp
+        # races its read_task against this so it can yield immediately on the
+        # same iteration that EXECUTING starts, closing the race window.
+        self._serial_yielding = asyncio.Event()
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -154,6 +163,7 @@ class ProxyCore:
                 self._state.value,
             )
             return
+        self._job_just_completed = False
         self._cancel_idle_timeout()
         self._state = ProxyState.PASSTHROUGH
         if self._detector:
@@ -170,9 +180,13 @@ class ProxyCore:
             self._buffer = None
         # EXECUTING/PAUSED: disconnect-safe — job continues without LightBurn.
         # State stays EXECUTING/PAUSED; _on_streamer_done handles the transition.
-        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
+        #
+        # _job_just_completed: the streamer finished and set state to PASSTHROUGH
+        # while the relay tasks were still winding down. Don't overwrite with
+        # DISCONNECTED — the proxy is ready for the next connection as-is.
+        if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED) or self._job_just_completed:
             logger.info(
-                "ProxyCore: client disconnected during %s — job execution continues",
+                "ProxyCore: client disconnected (state stays %s)",
                 self._state.value,
             )
             self._cancel_idle_timeout()
@@ -376,6 +390,16 @@ class ProxyCore:
         """
         return self._serial_readable
 
+    @property
+    def serial_yielding(self) -> asyncio.Event:
+        """Event that fires the instant EXECUTING starts (streamer taking serial).
+
+        Cleared → set on _finalize_job; cleared again on streamer done/shutdown.
+        _serial_to_tcp races its read_task against this to avoid stealing an
+        'ok' from the streamer on the loop iteration that straddles the boundary.
+        """
+        return self._serial_yielding
+
     # ------------------------------------------------------------------
     # Phase 3: Streamer lifecycle
     # ------------------------------------------------------------------
@@ -414,7 +438,8 @@ class ProxyCore:
         """Synchronous callback from GrblStreamer when streaming finishes."""
         self._streamer = None
         self._streamer_task = None
-        self._serial_readable.set()  # restore serial to _serial_to_tcp
+        self._serial_yielding.clear()  # no longer yielding — _serial_to_tcp can read
+        self._serial_readable.set()    # restore serial to _serial_to_tcp
 
         if result.completed:
             logger.info(
@@ -424,6 +449,7 @@ class ProxyCore:
             )
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
                 self._state = ProxyState.PASSTHROUGH
+                self._job_just_completed = True
         else:
             if result.alarm_code is not None:
                 logger.error(
@@ -452,6 +478,7 @@ class ProxyCore:
             await asyncio.gather(self._streamer_task, return_exceptions=True)
         self._streamer = None
         self._streamer_task = None
+        self._serial_yielding.clear()
         self._serial_readable.set()
 
     # ------------------------------------------------------------------
@@ -496,7 +523,8 @@ class ProxyCore:
         meta = await self._buffer.finalize()
         self._buffer = None
         self._state = ProxyState.EXECUTING
-        self._serial_readable.clear()  # streamer now owns serial reads
+        self._serial_readable.clear()   # streamer now owns serial reads
+        self._serial_yielding.set()     # wake any in-flight _serial_to_tcp read
         self._start_streamer(meta)
 
     async def _write_synthetic_status(self, writer: asyncio.StreamWriter) -> None:
