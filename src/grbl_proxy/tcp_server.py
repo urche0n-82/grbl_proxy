@@ -170,9 +170,7 @@ class TcpServer:
     ) -> None:
         """Forward lines from LightBurn (TCP) to the serial port."""
         try:
-            logger.debug("_tcp_to_serial: task started, stop_relay=%s", stop_relay.is_set())
             while not stop_relay.is_set():
-                logger.debug("_tcp_to_serial: waiting for data (stop_relay=%s)", stop_relay.is_set())
                 # Race TCP read against stop_relay so this task wakes promptly
                 # when serial disconnects (stop_relay set by _serial_to_tcp),
                 # rather than blocking until LightBurn sends more data.
@@ -199,14 +197,9 @@ class TcpServer:
                     logger.debug("TCP read error: %s", e)
                     break
 
-                logger.debug("_tcp_to_serial: read returned %d bytes", len(data))
-
                 if not data:
                     # EOF — LightBurn closed the connection
-                    logger.debug("_tcp_to_serial: EOF received")
                     break
-
-                logger.debug("TCP→Serial: %r", data)
 
                 if not self._serial.is_connected:
                     # Serial unavailable — respond to each incoming line with
@@ -236,7 +229,6 @@ class TcpServer:
                     await self._route_bytes(data, writer)
         finally:
             # Signal _serial_to_tcp to exit (LightBurn disconnected or task cancelled)
-            logger.debug("_tcp_to_serial: exiting, setting stop_relay")
             stop_relay.set()
 
     async def _route_bytes(self, data: bytes, writer: asyncio.StreamWriter) -> None:
