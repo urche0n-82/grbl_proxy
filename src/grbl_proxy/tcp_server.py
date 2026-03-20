@@ -131,8 +131,11 @@ class TcpServer:
             pass
 
         logger.info("TCP client disconnected: %s", peer)
-        self._current_writer = None
-        self._relay_tasks = []
+        # Only clear if this is still the active writer — a new _client_connected
+        # may have already replaced it while our gather was being cancelled.
+        if self._current_writer is writer:
+            self._current_writer = None
+            self._relay_tasks = []
         self._line_buf.clear()
 
     async def _drop_current_client(self, reason: str) -> None:
@@ -265,27 +268,56 @@ class TcpServer:
             # During EXECUTING the GrblStreamer owns the serial read path.
             # Wait here until the streamer releases it (serial_readable is set).
             if self._proxy is not None and not self._proxy.serial_readable.is_set():
+                # Signal that we are NOT reading serial — safe for streamer to start
+                self._proxy.serial_read_idle.set()
                 await self._proxy.serial_readable.wait()
                 if stop_relay.is_set():
                     break
                 continue
 
-            # Race read_line() against stop_relay so _serial_to_tcp wakes up
-            # promptly when the TCP side closes, rather than blocking until the
-            # next 1-second serial readline timeout tick.
+            # Signal that we ARE about to read serial
+            if self._proxy is not None:
+                self._proxy.serial_read_idle.clear()
+
+            # Race read_line() against stop_relay and serial_yield so
+            # _serial_to_tcp wakes up promptly when the TCP side closes OR
+            # when _finalize_job needs to hand off serial to the streamer.
             read_task = asyncio.create_task(self._serial.read_line())
             stop_task = asyncio.create_task(stop_relay.wait())
+
+            yield_task = None
+            if self._proxy is not None:
+                yield_task = asyncio.create_task(self._proxy.serial_yield.wait())
+
+            wait_set = {read_task, stop_task}
+            if yield_task is not None:
+                wait_set.add(yield_task)
+
             try:
-                await asyncio.wait(
-                    [read_task, stop_task], return_when=asyncio.FIRST_COMPLETED
-                )
+                await asyncio.wait(wait_set, return_when=asyncio.FIRST_COMPLETED)
             except asyncio.CancelledError:
                 read_task.cancel()
                 stop_task.cancel()
+                if yield_task is not None:
+                    yield_task.cancel()
                 self._serial.close_immediately()
                 raise
             finally:
                 stop_task.cancel()
+                if yield_task is not None:
+                    yield_task.cancel()
+
+            # Check if _finalize_job requested us to yield serial reads.
+            # Wait for the in-flight read thread to finish (can't cancel a
+            # thread) so the serial fd is not accessed concurrently, then
+            # signal idle and loop back to the serial_readable check.
+            if self._proxy is not None and self._proxy.serial_yield.is_set():
+                try:
+                    await asyncio.wait_for(asyncio.shield(read_task), timeout=2.0)
+                except (asyncio.TimeoutError, Exception):
+                    read_task.cancel()
+                self._proxy.serial_read_idle.set()
+                continue  # back to top → serial_readable check → waits
 
             if stop_relay.is_set():
                 logger.debug("_serial_to_tcp: stop_relay set, exiting")
@@ -294,6 +326,10 @@ class TcpServer:
                 # rather than waiting up to READLINE_TIMEOUT for it to return.
                 self._serial.close_immediately()
                 break
+
+            # Signal idle now that the read has completed
+            if self._proxy is not None:
+                self._proxy.serial_read_idle.set()
 
             try:
                 line = read_task.result()

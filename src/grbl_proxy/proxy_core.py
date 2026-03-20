@@ -135,6 +135,10 @@ class ProxyCore:
         self._streamer_task: asyncio.Task | None = None
         self._serial_readable = asyncio.Event()
         self._serial_readable.set()  # readable by default; cleared during EXECUTING
+        # Handshake events for safe serial read handoff to streamer
+        self._serial_read_idle = asyncio.Event()
+        self._serial_read_idle.set()  # idle by default (no one is reading)
+        self._serial_yield = asyncio.Event()  # one-shot: tells _serial_to_tcp to stop reading
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -376,6 +380,24 @@ class ProxyCore:
         """
         return self._serial_readable
 
+    @property
+    def serial_read_idle(self) -> asyncio.Event:
+        """Event set when _serial_to_tcp is NOT actively reading serial.
+
+        Used as a handshake: _finalize_job waits on this before starting the
+        streamer, ensuring no concurrent serial reads.
+        """
+        return self._serial_read_idle
+
+    @property
+    def serial_yield(self) -> asyncio.Event:
+        """One-shot signal telling _serial_to_tcp to abandon its current read.
+
+        Set by _finalize_job before waiting for serial_read_idle. Cleared
+        after the handshake completes.
+        """
+        return self._serial_yield
+
     # ------------------------------------------------------------------
     # Phase 3: Streamer lifecycle
     # ------------------------------------------------------------------
@@ -414,6 +436,7 @@ class ProxyCore:
         """Synchronous callback from GrblStreamer when streaming finishes."""
         self._streamer = None
         self._streamer_task = None
+        self._serial_yield.clear()
         self._serial_readable.set()  # restore serial to _serial_to_tcp
 
         if result.completed:
@@ -452,6 +475,7 @@ class ProxyCore:
             await asyncio.gather(self._streamer_task, return_exceptions=True)
         self._streamer = None
         self._streamer_task = None
+        self._serial_yield.clear()
         self._serial_readable.set()
 
     # ------------------------------------------------------------------
@@ -497,6 +521,17 @@ class ProxyCore:
         self._buffer = None
         self._state = ProxyState.EXECUTING
         self._serial_readable.clear()  # streamer now owns serial reads
+        # Handshake: wait for _serial_to_tcp to finish any in-flight serial read
+        # before the streamer starts its own reads. Prevents concurrent reads on
+        # the same pyserial port (which corrupts character-counting flow control).
+        self._serial_yield.set()  # interrupt in-flight read
+        try:
+            await asyncio.wait_for(self._serial_read_idle.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "_serial_to_tcp did not become idle within 2s — starting streamer anyway"
+            )
+        self._serial_yield.clear()  # reset for next time
         self._start_streamer(meta)
 
     async def _write_synthetic_status(self, writer: asyncio.StreamWriter) -> None:

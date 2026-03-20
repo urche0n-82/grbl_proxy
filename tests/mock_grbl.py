@@ -42,8 +42,17 @@ class MockSerialConnection:
         return self._connected
 
     async def read_line(self) -> str:
-        """Block until a line is available in the receive queue."""
-        return await self._rx_queue.get()
+        """Return the next line from the receive queue, or "" on timeout.
+
+        Uses a 1-second timeout to match the real SerialConnection behaviour
+        (READLINE_TIMEOUT). This is critical for the serial-yield handshake:
+        _serial_to_tcp must be able to finish its in-flight read within a
+        bounded time so the streamer can safely take over.
+        """
+        try:
+            return await asyncio.wait_for(self._rx_queue.get(), timeout=1.0)
+        except asyncio.TimeoutError:
+            return ""
 
     async def write(self, data: bytes) -> None:
         """Accept bytes from the TCP relay and optionally auto-respond."""

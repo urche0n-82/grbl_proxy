@@ -99,6 +99,24 @@ async def _wait_for_state(
             )
 
 
+async def _wait_for_state_in(
+    core: ProxyCore,
+    targets: set[ProxyState],
+    timeout: float = 3.0,
+    poll: float = 0.05,
+) -> None:
+    """Poll until core.state is in targets or raise TimeoutError."""
+    elapsed = 0.0
+    while core.state not in targets:
+        await asyncio.sleep(poll)
+        elapsed += poll
+        if elapsed >= timeout:
+            names = ", ".join(t.value for t in targets)
+            raise TimeoutError(
+                f"Timed out waiting for state in {{{names}}}, currently {core.state.value}"
+            )
+
+
 # ---------------------------------------------------------------------------
 # TestStreamerUnit — GrblStreamer without TcpServer
 # ---------------------------------------------------------------------------
@@ -349,10 +367,17 @@ class TestProxyCoreExecuting:
             # State must still be EXECUTING — job was not aborted
             assert core.state == ProxyState.EXECUTING
 
-            # Now inject oks so the streamer can finish
+            # Now inject oks so the streamer can finish.
+            # After the streamer completes, state goes PASSTHROUGH → DISCONNECTED
+            # as the gather cleanup calls on_client_disconnected. Both are valid
+            # end states (PASSTHROUGH is transient when the client already left).
             for _ in range(5):
                 mock.inject("ok")
-            await _wait_for_state(core, ProxyState.PASSTHROUGH, timeout=3.0)
+            await _wait_for_state_in(
+                core,
+                {ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED},
+                timeout=3.0,
+            )
         finally:
             await server.stop()
 
@@ -617,10 +642,15 @@ class TestStreamerIntegration:
             # State must still be EXECUTING — job was not aborted by disconnect
             assert core.state == ProxyState.EXECUTING
 
-            # Finish the job
+            # Finish the job. After streamer completes, state goes
+            # PASSTHROUGH → DISCONNECTED as the gather cleanup runs.
             for _ in range(5):
                 mock.inject("ok")
-            await _wait_for_state(core, ProxyState.PASSTHROUGH, timeout=3.0)
+            await _wait_for_state_in(
+                core,
+                {ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED},
+                timeout=3.0,
+            )
         finally:
             await server.stop()
 
