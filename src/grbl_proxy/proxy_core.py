@@ -520,8 +520,12 @@ class ProxyCore:
             )
         else:
             response = grbl_protocol.make_status_response(state=grbl_state)
-        writer.write(response.encode())
-        await writer.drain()
+        logger.debug("Synthetic status → TCP: %r", response)
+        try:
+            writer.write(response.encode())
+            await writer.drain()
+        except (BrokenPipeError, ConnectionResetError) as e:
+            logger.debug("TCP write error sending synthetic status: %s", e)
 
     @staticmethod
     async def _spoof_ok(writer: asyncio.StreamWriter) -> None:
