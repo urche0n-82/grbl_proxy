@@ -130,30 +130,25 @@ def run() -> None:
     executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="grbl-proxy")
     loop = asyncio.new_event_loop()
     loop.set_default_executor(executor)
+
+    # stop_event is created here (before the loop runs) and passed into _main
+    # so that both the sync signal handler below and _main's async signal
+    # handlers share the same event object.
     stop_event = asyncio.Event()
 
-    # Install a synchronous SIGINT handler BEFORE the event loop starts.
-    # This fires on the main thread regardless of what threads are running,
-    # and sets stop_event so _main's graceful shutdown sequence runs.
-    def _sigint_handler(_sig, _frame):
-        print("SIGINT received — requesting graceful shutdown", flush=True)
+    # Synchronous SIGINT handler — runs on the main thread even when a worker
+    # thread holds the GIL (e.g. blocked in pyserial readline). Schedules
+    # stop_event.set() onto the event loop so _main's shutdown sequence runs.
+    def _sigint_sync(_sig, _frame):
+        print("\nSIGINT — shutting down gracefully", flush=True)
         loop.call_soon_threadsafe(stop_event.set)
 
-    signal.signal(signal.SIGINT, _sigint_handler)
+    signal.signal(signal.SIGINT, _sigint_sync)
 
-    main_task = loop.create_task(
-        _main(config_path=args.config, debug=args.debug, stop_event=stop_event)
-    )
     try:
-        loop.run_until_complete(main_task)
-    except KeyboardInterrupt:
-        print("KeyboardInterrupt caught in run() — triggering graceful shutdown", flush=True)
-        loop.call_soon_threadsafe(stop_event.set)
-        loop.run_until_complete(main_task)
+        loop.run_until_complete(
+            _main(config_path=args.config, debug=args.debug, stop_event=stop_event)
+        )
     finally:
-        print("run() finally block reached", flush=True)
-        # Shut down executor without waiting for blocked threads to finish.
-        # This allows the process to exit even if a serial.Serial() call is
-        # stuck in a thread pool worker.
         executor.shutdown(wait=False, cancel_futures=True)
         loop.close()
