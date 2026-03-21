@@ -18,6 +18,15 @@ from grbl_proxy.proxy_core import ProxyCore
 from grbl_proxy.serial_conn import SerialConnection, SerialDisconnectedError
 from grbl_proxy.tcp_server import TcpServer
 
+try:
+    import uvicorn
+    from grbl_proxy.web.app import create_app
+    from grbl_proxy.web.console_log import ConsoleLog, _ConsoleLogHandler
+    from grbl_proxy.web.status import ProxyControl, ProxyStatus
+    _WEB_AVAILABLE = True
+except ImportError:
+    _WEB_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 GRBL_INIT_DELAY = 2.0  # seconds to wait after serial open before sending commands
@@ -71,6 +80,31 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
         await serial_conn.disconnect()
         return
 
+    # Web server (FastAPI/uvicorn) — optional, skipped if fastapi not installed.
+    uv_server = None
+    web_task = None
+    if _WEB_AVAILABLE:
+        proxy_status = ProxyStatus(proxy_core)
+        proxy_control = ProxyControl(proxy_core)
+        console_log = ConsoleLog()
+        logging.getLogger("grbl_proxy.tcp_server").addHandler(
+            _ConsoleLogHandler(console_log)
+        )
+        web_app = create_app(proxy_status, proxy_control, console_log, config)
+        uv_server = uvicorn.Server(
+            uvicorn.Config(
+                web_app,
+                host=config.web.host,
+                port=config.web.port,
+                loop="none",
+                log_level="warning",
+            )
+        )
+        web_task = asyncio.create_task(uv_server.serve(), name="web-server")
+        logger.info("  Web dashboard: http://%s:%d", config.web.host, config.web.port)
+    else:
+        logger.warning("fastapi/uvicorn not installed — web dashboard disabled")
+
     # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C).
     loop = asyncio.get_running_loop()
     if stop_event is None:
@@ -91,6 +125,10 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
         pass
 
     logger.info("Shutting down...")
+    if uv_server is not None and web_task is not None:
+        logger.info("Shutdown: stopping web server")
+        uv_server.should_exit = True
+        await asyncio.gather(web_task, return_exceptions=True)
     logger.info("Shutdown: signalling serial connection")
     serial_conn.signal_shutdown()
     logger.info("Shutdown: cancelling reconnect task")

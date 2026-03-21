@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>grbl-proxy</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>grbl-proxy</h1>
+    <span id="connection-indicator" class="indicator offline" title="WebSocket status"></span>
+  </header>
+
+  <main>
+    <section class="card" id="status-card">
+      <h2>Machine Status</h2>
+      <div class="status-grid">
+        <div class="status-row">
+          <span class="label">Proxy state</span>
+          <span id="proxy-state" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">GRBL state</span>
+          <span id="grbl-state" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Position (X, Y, Z)</span>
+          <span id="position" class="value mono">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Feed / Spindle</span>
+          <span id="feed-spindle" class="value mono">—</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="card" id="job-card">
+      <h2>Job</h2>
+      <div class="progress-wrap">
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+        </div>
+        <span id="progress-pct" class="progress-label">0%</span>
+      </div>
+      <div class="status-grid">
+        <div class="status-row">
+          <span class="label">Lines</span>
+          <span id="job-lines" class="value mono">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Elapsed</span>
+          <span id="job-elapsed" class="value mono">—</span>
+        </div>
+      </div>
+      <div class="button-row">
+        <button id="btn-pause"  class="btn btn-warning" onclick="jobAction('pause')">Pause</button>
+        <button id="btn-resume" class="btn btn-success" onclick="jobAction('resume')">Resume</button>
+        <button id="btn-cancel" class="btn btn-danger"  onclick="jobAction('cancel')">Cancel</button>
+      </div>
+    </section>
+
+    <section class="card" id="console-card">
+      <h2>Console</h2>
+      <div id="console-log" class="console-log"></div>
+      <div class="console-input-row">
+        <input id="console-input" type="text" placeholder="Send GRBL command…" autocomplete="off" />
+        <button class="btn btn-primary" onclick="sendConsole()">Send</button>
+      </div>
+    </section>
+  </main>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>
