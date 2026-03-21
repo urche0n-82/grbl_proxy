@@ -61,7 +61,13 @@
     </section>
 
     <section class="card" id="console-card">
-      <h2>Console</h2>
+      <div class="console-header">
+        <h2>Console</h2>
+        <label class="toggle-label">
+          <input type="checkbox" id="hide-status" checked />
+          Hide status responses
+        </label>
+      </div>
       <div id="console-log" class="console-log"></div>
       <div class="console-input-row">
         <input id="console-input" type="text" placeholder="Send GRBL command…" autocomplete="off" />

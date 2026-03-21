@@ -379,6 +379,26 @@ def test_console_log_handler_tx():
     assert entries[0]["text"] == "G0 X10"
 
 
+def test_console_log_handler_web_tx():
+    import logging
+    log = ConsoleLog()
+    handler = _ConsoleLogHandler(log)
+    record = logging.LogRecord(
+        name="grbl_proxy.web.status",
+        level=logging.DEBUG,
+        pathname="",
+        lineno=0,
+        msg="Web→Serial: $$",
+        args=(),
+        exc_info=None,
+    )
+    handler.emit(record)
+    entries = log.recent()
+    assert len(entries) == 1
+    assert entries[0]["dir"] == "tx"
+    assert entries[0]["text"] == "$$"
+
+
 def test_console_log_handler_ignores_other():
     import logging
     log = ConsoleLog()

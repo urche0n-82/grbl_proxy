@@ -14,8 +14,10 @@ from collections import deque
 
 # tcp_server logs serial RX at DEBUG as:  Serial→TCP: b'ok\n'
 # and TX (routed lines) as:               Route [Passthrough]: G0 X10
+# web/status.py logs web console TX as:   Web→Serial: $$
 _RX_RE = re.compile(r"Serial[→>-]+TCP:\s*(.*)", re.IGNORECASE)
 _TX_RE = re.compile(r"Route\s*\[[^\]]+\]:\s*(.*)")
+_WEB_TX_RE = re.compile(r"Web[→>-]+Serial:\s*(.*)", re.IGNORECASE)
 
 
 class ConsoleLog:
@@ -55,6 +57,10 @@ class _ConsoleLogHandler(logging.Handler):
                 self._console.add("rx", text)
                 return
             m = _TX_RE.search(msg)
+            if m:
+                self._console.add("tx", m.group(1).strip())
+                return
+            m = _WEB_TX_RE.search(msg)
             if m:
                 self._console.add("tx", m.group(1).strip())
         except Exception:

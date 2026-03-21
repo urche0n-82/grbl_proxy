@@ -107,6 +107,15 @@ async function jobAction(action) {
 
 let consoleAutoScroll = true;
 
+function isStatusResponse(text) {
+  // GRBL status reports: <Idle|MPos:...> or <Run|...> etc.
+  return text.trimStart().startsWith("<") && text.trimEnd().endsWith(">");
+}
+
+function hideStatusEnabled() {
+  return $("hide-status").checked;
+}
+
 async function loadConsole() {
   try {
     const resp = await fetch("/api/console?n=100");
@@ -120,6 +129,8 @@ async function loadConsole() {
 }
 
 function appendConsoleLine(entry) {
+  if (hideStatusEnabled() && entry.dir === "rx" && isStatusResponse(entry.text)) return;
+
   const el = $("console-log");
   const div = document.createElement("div");
   div.className = "log-line";
@@ -162,6 +173,9 @@ async function sendConsole() {
 $("console-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendConsole();
 });
+
+// Re-render console immediately when the toggle changes
+$("hide-status").addEventListener("change", loadConsole);
 
 // Pause auto-scroll when user scrolls up
 $("console-log").addEventListener("scroll", (e) => {

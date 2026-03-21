@@ -124,6 +124,25 @@ main {
 /* Console */
 #console-card { grid-column: 1 / -1; }
 
+.console-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 14px;
+}
+.console-header h2 { margin-bottom: 0; }
+
+.toggle-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  cursor: pointer;
+  user-select: none;
+}
+.toggle-label input[type="checkbox"] { cursor: pointer; accent-color: var(--accent); }
+
 .console-log {
   background: #111;
   border: 1px solid var(--border);

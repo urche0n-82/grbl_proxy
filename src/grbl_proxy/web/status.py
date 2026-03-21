@@ -8,9 +8,12 @@ paths that process_raw_byte already uses.
 
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from grbl_proxy.proxy_core import ProxyCore, ProxyState
@@ -166,8 +169,10 @@ class ProxyControl:
             return False, f"Cannot send console command in state {core._state.value}"
         if core._serial_conn is None:
             return False, "No serial connection"
+        cmd = command.strip()
         try:
-            await core._serial_conn.write((command.strip() + "\n").encode())
+            await core._serial_conn.write((cmd + "\n").encode())
         except Exception as e:
             return False, str(e)
+        logger.debug("Web→Serial: %s", cmd)
         return True, "ok"
