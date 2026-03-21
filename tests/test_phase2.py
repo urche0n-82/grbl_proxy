@@ -106,11 +106,14 @@ class TestJobBuffer:
         assert meta.path == buf.path or meta.path is not None
 
     async def test_finalize_writes_meta_json(self, tmp_path):
-        buf = JobBuffer(tmp_path / "jobs")
+        jobs_dir = tmp_path / "jobs"
+        buf = JobBuffer(jobs_dir)
         await buf.open()
         await buf.write_line("G0 X0")
-        await buf.finalize()
-        meta_path = tmp_path / "jobs" / "current.meta.json"
+        meta = await buf.finalize()
+        # Phase 5: finalize renames to timestamped files, not current.*
+        stem = meta.path.stem
+        meta_path = jobs_dir / f"{stem}.meta.json"
         assert meta_path.exists()
         data = json.loads(meta_path.read_text())
         assert data["line_count"] == 1
@@ -530,7 +533,10 @@ class TestBufferingMode:
         finally:
             await server.stop()
 
-        content = (jobs_dir / "current.gcode").read_text()
+        # Phase 5: after finalize the file is timestamped, not current.gcode
+        gcode_files = list(jobs_dir.glob("*.gcode"))
+        assert len(gcode_files) == 1, f"Expected 1 gcode file, got {gcode_files}"
+        content = gcode_files[0].read_text()
         assert "G0 X10\n" in content
         assert "G1 Y20\n" in content
         assert "G1 Y30\n" in content

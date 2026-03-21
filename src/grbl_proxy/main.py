@@ -84,7 +84,7 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
     uv_server = None
     web_task = None
     if _WEB_AVAILABLE:
-        proxy_status = ProxyStatus(proxy_core)
+        proxy_status = ProxyStatus(proxy_core, serial_conn=serial_conn)
         proxy_control = ProxyControl(proxy_core, serial_conn=serial_conn)
         console_log = ConsoleLog()
         logging.getLogger("grbl_proxy.tcp_server").addHandler(
@@ -108,6 +108,10 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
     else:
         logger.warning("fastapi/uvicorn not installed — web dashboard disabled")
 
+    # Start idle GRBL status poll (1 Hz) so dashboard shows machine state
+    # even when LightBurn is not connected.
+    proxy_core.start_idle_poll(serial_conn, poll_hz=config.machine.status_poll_hz)
+
     # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C).
     loop = asyncio.get_running_loop()
     if stop_event is None:
@@ -128,6 +132,7 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
         pass
 
     logger.info("Shutting down...")
+    proxy_core.stop_idle_poll()
     if uv_server is not None and web_task is not None:
         logger.info("Shutdown: stopping web server")
         uv_server.should_exit = True

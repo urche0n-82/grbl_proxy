@@ -34,14 +34,16 @@ class StatusSnapshot:
     job_total_lines: int | None
     job_progress_pct: float | None
     job_elapsed_s: float | None
+    serial_connected: bool     # True when serial port is open
     timestamp: float           # time.monotonic() at snapshot time
 
 
 class ProxyStatus:
     """Read-only view of ProxyCore for the web layer."""
 
-    def __init__(self, core: "ProxyCore") -> None:
+    def __init__(self, core: "ProxyCore", serial_conn=None) -> None:
         self._core = core
+        self._serial = serial_conn
 
     def snapshot(self) -> StatusSnapshot:
         """Return an atomic snapshot of current state.
@@ -83,6 +85,10 @@ class ProxyStatus:
         if buf is not None:
             elapsed_s = round(time.time() - buf._start_time, 1)
 
+        serial_connected = False
+        if self._serial is not None:
+            serial_connected = bool(self._serial.is_connected)
+
         return StatusSnapshot(
             proxy_state=state.value,
             grbl_state=grbl_state,
@@ -95,6 +101,7 @@ class ProxyStatus:
             job_total_lines=total_lines,
             job_progress_pct=progress_pct,
             job_elapsed_s=elapsed_s,
+            serial_connected=serial_connected,
             timestamp=time.monotonic(),
         )
 
@@ -170,6 +177,73 @@ class ProxyControl:
                 await serial.write(b"\x18")
             except Exception:
                 pass
+        return True, "ok"
+
+    async def start_uploaded_job(
+        self, storage_dir, original_filename: str | None = None
+    ) -> tuple[bool, str]:
+        """Start a previously uploaded G-code job. Valid in PASSTHROUGH or DISCONNECTED."""
+        from grbl_proxy.proxy_core import ProxyState
+        from grbl_proxy.job_buffer import JobMetadata
+        import time as _time
+        from pathlib import Path as _Path
+
+        core = self._core
+        serial = self._serial_conn()
+
+        if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED):
+            return False, f"Cannot start job in state {core._state.value}"
+        if serial is None:
+            return False, "No serial connection"
+
+        storage_dir = _Path(storage_dir).expanduser()
+        uploaded = storage_dir / "uploaded.gcode"
+        if not uploaded.exists():
+            return False, "No uploaded file found"
+
+        # Count lines and build metadata
+        try:
+            line_count = sum(1 for _ in uploaded.open(encoding="utf-8"))
+        except Exception as e:
+            return False, f"Cannot read uploaded file: {e}"
+
+        start_time = _time.time()
+        from datetime import datetime as _dt
+        timestamp = _dt.fromtimestamp(start_time).strftime("%Y%m%d_%H%M%S")
+        archived_path = storage_dir / f"{timestamp}.gcode"
+
+        # Rename uploaded.gcode to timestamp.gcode so history works
+        try:
+            uploaded.rename(archived_path)
+        except Exception as e:
+            return False, f"Cannot archive uploaded file: {e}"
+
+        meta = JobMetadata(
+            path=archived_path,
+            line_count=line_count,
+            start_time=start_time,
+            end_time=start_time,
+            duration_s=0.0,
+            source="upload",
+            original_filename=original_filename,
+        )
+
+        # Wire serial_conn into core so _start_streamer can use it
+        if core._serial_conn is None:
+            core._serial_conn = serial
+
+        core._state = ProxyState.EXECUTING
+        core._serial_readable.clear()
+        core._serial_yield.set()
+        try:
+            import asyncio as _asyncio
+            await _asyncio.wait_for(core._serial_read_idle.wait(), timeout=2.0)
+        except Exception:
+            pass
+        core._serial_yield.clear()
+        core._start_streamer(meta)
+
+        logger.info("Web-initiated job started: %s (%d lines)", archived_path, line_count)
         return True, "ok"
 
     async def send_console(self, command: str) -> tuple[bool, str]:

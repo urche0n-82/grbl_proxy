@@ -41,6 +41,15 @@ function applySnapshot(s) {
   $("proxy-state").textContent = s.proxy_state ?? "—";
   $("grbl-state").textContent  = s.grbl_state  ?? "—";
 
+  const serialEl = $("serial-connected");
+  if (s.serial_connected != null) {
+    serialEl.textContent = s.serial_connected ? "Connected" : "Disconnected";
+    serialEl.className = "value " + (s.serial_connected ? "serial-ok" : "serial-off");
+  } else {
+    serialEl.textContent = "—";
+    serialEl.className = "value";
+  }
+
   if (s.mpos_x != null) {
     $("position").textContent =
       `${s.mpos_x.toFixed(3)},  ${s.mpos_y.toFixed(3)},  ${s.mpos_z.toFixed(3)}`;
@@ -209,11 +218,98 @@ $("console-log").addEventListener("scroll", (e) => {
 });
 
 // ---------------------------------------------------------------------------
+// Upload & Run
+// ---------------------------------------------------------------------------
+
+async function uploadFile() {
+  const fileInput = $("gcode-file");
+  const file = fileInput.files[0];
+  if (!file) {
+    $("upload-status").textContent = "Select a file first.";
+    return;
+  }
+  const formData = new FormData();
+  formData.append("file", file);
+  try {
+    const resp = await fetch("/api/job", { method: "POST", body: formData });
+    if (resp.ok) {
+      const data = await resp.json();
+      $("upload-status").textContent = `Uploaded: ${file.name} (${data.line_count} lines)`;
+      $("btn-run").disabled = false;
+      $("btn-run").dataset.filename = file.name;
+    } else {
+      const body = await resp.json().catch(() => ({}));
+      $("upload-status").textContent = `Upload failed: ${body.detail ?? resp.status}`;
+    }
+  } catch (e) {
+    $("upload-status").textContent = `Upload error: ${e.message}`;
+  }
+}
+
+async function runUploaded() {
+  try {
+    const resp = await fetch("/api/job/start", { method: "POST" });
+    if (resp.ok) {
+      $("upload-status").textContent = "Job started.";
+      $("btn-run").disabled = true;
+    } else {
+      const body = await resp.json().catch(() => ({}));
+      $("upload-status").textContent = `Start failed: ${body.detail ?? resp.status}`;
+    }
+  } catch (e) {
+    $("upload-status").textContent = `Start error: ${e.message}`;
+  }
+}
+
+$("btn-upload").addEventListener("click", uploadFile);
+$("btn-run").addEventListener("click", runUploaded);
+
+// ---------------------------------------------------------------------------
+// Job History
+// ---------------------------------------------------------------------------
+
+async function loadHistory() {
+  try {
+    const resp = await fetch("/api/jobs");
+    const jobs = await resp.json();
+    const tbody = $("history-body");
+    if (!jobs.length) {
+      tbody.innerHTML = '<tr><td colspan="5" class="history-empty">No completed jobs yet.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = "";
+    for (const job of jobs) {
+      const dt = new Date(job.start_time * 1000);
+      const dateStr = dt.toLocaleDateString() + " " + dt.toLocaleTimeString();
+      const dur = formatDuration(job.duration_s ?? 0);
+      const source = job.source === "upload" && job.original_filename
+        ? escapeHtml(job.original_filename)
+        : (job.source ?? "lightburn");
+      // Extract timestamp stem from path (e.g. "20250321_143022")
+      const stem = (job.path ?? "").replace(/.*\//, "").replace(/\.gcode$/, "");
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td class="mono">${escapeHtml(dateStr)}</td>` +
+        `<td>${source}</td>` +
+        `<td class="mono">${job.line_count ?? "—"}</td>` +
+        `<td class="mono">${dur}</td>` +
+        `<td><a href="/api/jobs/${encodeURIComponent(stem)}/download" class="dl-link">↓</a></td>`;
+      tbody.appendChild(tr);
+    }
+  } catch (e) {
+    console.warn("history load error", e);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
 connectWS();
 loadConsole();
+loadHistory();
 
 // Poll for new console entries and append only the new ones
 setInterval(pollConsole, 1000);
+// Refresh history every 30s
+setInterval(loadHistory, 30000);

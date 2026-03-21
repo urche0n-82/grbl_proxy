@@ -13,7 +13,10 @@ A Raspberry Pi-based proxy that sits between [LightBurn](https://lightburnsoftwa
 - **Transparent passthrough** — jogging, homing, framing, and console commands all work normally when idle
 - **Disconnect-safe jobs** — once a job is buffered, it executes to completion regardless of the LightBurn connection
 - **Web dashboard** — real-time position, job progress, pause/resume/cancel, and console panel accessible from any browser on the network
-- **REST API** — machine state, job control, and G-code upload over HTTP
+- **Standalone operation** — upload G-code files directly from the dashboard and run them without LightBurn connected
+- **Job history** — completed jobs are archived as timestamped files; the dashboard lists past runs with duration, line count, and a download link
+- **Idle GRBL polling** — machine state and position are visible in the dashboard even when LightBurn is not connected
+- **REST API** — machine state, job control, G-code upload, and history over HTTP
 - **Auto-reconnect** — if the USB cable to the laser drops, the proxy reconnects automatically
 - **Single TCP client** — if LightBurn reconnects, the old socket is cleanly replaced
 
@@ -122,10 +125,12 @@ http://<pi-ip>:8080
 
 The dashboard shows:
 
-- **Machine status** — proxy state, GRBL state (Idle / Run / Hold / Alarm), current position (X, Y, Z), feed rate and spindle power
+- **Machine status** — proxy state, GRBL state (Idle / Run / Hold / Alarm), serial connection badge, current position (X, Y, Z), feed rate and spindle power
 - **Job progress** — progress bar, lines sent / total, elapsed time
 - **Controls** — Pause, Resume, and Cancel buttons (active only when applicable)
-- **Console** — scrolling log of recent serial I/O with a command input field for sending arbitrary GRBL commands
+- **Upload & Run** — file picker to upload a `.gcode` file and run it directly from the browser (no LightBurn required)
+- **Console** — scrolling log of recent serial I/O with a command input field and a toggle to hide status-report noise
+- **Job history** — table of completed jobs with date, source (LightBurn or upload), line count, duration, and a download link for the G-code file
 
 The REST API is available at `/api/` and is documented interactively at `http://<pi-ip>:8080/api/docs`.
 
@@ -136,19 +141,28 @@ The REST API is available at `/api/` and is documented interactively at `http://
 web:
   host: 0.0.0.0   # bind address — 0.0.0.0 listens on all interfaces
   port: 8080       # change if 8080 conflicts with something else on the Pi
+
+machine:
+  status_poll_hz: 4   # how often (Hz) to send ? to GRBL when LightBurn is not connected
+
+job:
+  storage_dir: ~/.grbl-proxy/jobs   # where completed job files are archived
+  max_history: 20                   # number of completed jobs to keep; oldest deleted when exceeded
 ```
 
 ### REST API reference
 
 | Endpoint | Method | Description |
 |---|---|---|
-| `/api/status` | GET | Full machine and proxy state snapshot |
+| `/api/status` | GET | Full machine and proxy state snapshot (includes `serial_connected`) |
 | `/api/job` | GET | Job progress (lines sent, total, percentage, elapsed time) |
 | `/api/job` | POST | Upload a G-code file (multipart form, field `file`) |
-| `/api/job/start` | POST | Start an uploaded file (proxy must be in Passthrough state) |
+| `/api/job/start` | POST | Start the uploaded file — valid in Passthrough or Disconnected state |
 | `/api/job/pause` | POST | Send feed hold — valid in Executing state |
 | `/api/job/resume` | POST | Send cycle resume — valid in Paused state |
 | `/api/job/cancel` | POST | Soft reset + cancel — valid in Executing or Paused state |
+| `/api/jobs` | GET | List of completed job metadata, newest first (capped at `max_history`) |
+| `/api/jobs/{timestamp}/download` | GET | Download a completed job's G-code file |
 | `/api/console` | GET | Recent serial console log (`?n=50` to control count) |
 | `/api/console` | POST | Send a GRBL command (`{"command": "$$"}`) — valid in Passthrough state |
 | `/api/settings` | GET | Current proxy configuration |
@@ -173,7 +187,7 @@ pytest
 All tests run without hardware using an in-process GRBL mock — no serial port required.
 
 ```
-125 passed
+148 passed
 ```
 
 ### CLI options
@@ -215,7 +229,8 @@ grbl-proxy/
 │   ├── test_phase1.py       # Passthrough relay tests
 │   ├── test_phase2.py       # Job detection and buffering tests
 │   ├── test_phase3.py       # Streamer and execution tests
-│   └── test_phase4.py       # Web API tests
+│   ├── test_phase4.py       # Web API tests
+│   └── test_phase5.py       # Job history, idle poll, upload+run tests
 ├── systemd/
 │   └── grbl-proxy.service
 └── config.yaml.example
@@ -277,14 +292,19 @@ A lightweight browser UI served from the Pi on port 8080 (configurable). See [We
 - Live machine state, position, feed rate, and job progress
 - Pause, resume, and cancel controls that work independently of LightBurn
 - REST API and interactive API docs at `/api/docs`
-- G-code file upload and job start via the API (bypass LightBurn for repeat jobs)
-- Recent serial console log with command input
+- Recent serial console log with command input and status-response filter
 
-### Phase 5 — Polish and observability _(planned)_
+### Phase 5 ✅ — Standalone operation and job history
 
-- Job history: completed job log with filename, duration, line count, and outcome
+- **Idle GRBL polling** — the proxy sends `?` to GRBL at configurable rate when no LightBurn client is connected; machine state and position are visible in the dashboard at all times
+- **Serial connection badge** — the dashboard shows a separate connected/disconnected indicator for the serial link to the laser, independent of the LightBurn proxy state
+- **Upload & Run** — upload a `.gcode` file directly from the browser and run it without LightBurn; the file is archived in job history on completion like any other job
+- **Job history** — every completed job (from LightBurn or direct upload) is saved as a timestamped `.gcode` + `.meta.json` pair; the dashboard lists past runs with source, line count, duration, and a download link; history is capped at `job.max_history` (default 20) with automatic rotation
+
+### Phase 6 — _(planned)_
+
 - Alarm recovery workflow: guided `$X` / `$H` from the dashboard after a fault
-- Webcam integration: optional MJPEG stream from a Pi camera or USB webcam embedded in the dashboard
+- Webcam integration: optional MJPEG stream from a USB webcam embedded in the dashboard
 - Proxy configuration UI: edit `config.yaml` settings from the browser
 
 ## License

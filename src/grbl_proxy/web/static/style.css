@@ -79,6 +79,10 @@ main {
 .value { font-weight: 500; text-align: right; }
 .mono  { font-family: var(--font-mono); font-size: 0.9em; }
 
+/* Serial connection state */
+.serial-ok  { color: var(--success); }
+.serial-off { color: var(--muted); }
+
 /* Progress bar */
 .progress-wrap {
   display: flex;
@@ -179,3 +183,56 @@ main {
   outline: none;
 }
 .console-input-row input:focus { border-color: var(--accent); }
+
+/* Upload & Run */
+.card-divider { border: none; border-top: 1px solid var(--border); margin: 16px 0 12px; }
+.card h3 { font-size: 0.8rem; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
+
+.upload-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.upload-row input[type="file"] {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  font-size: 0.85em;
+}
+.upload-status {
+  margin-top: 8px;
+  font-size: 0.82em;
+  color: var(--muted);
+  min-height: 1.2em;
+}
+
+/* Job History */
+#history-card { grid-column: 1 / -1; }
+
+.history-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.85em;
+}
+.history-table th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 600;
+  padding: 4px 10px 8px;
+  border-bottom: 1px solid var(--border);
+}
+.history-table td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: middle;
+}
+.history-table tr:last-child td { border-bottom: none; }
+.history-empty { color: var(--muted); text-align: center; padding: 16px; }
+
+.dl-link {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 1.1em;
+}
+.dl-link:hover { opacity: 0.75; }

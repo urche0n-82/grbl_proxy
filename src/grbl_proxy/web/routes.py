@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from fastapi import APIRouter, HTTPException, Request, UploadFile, WebSocket
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 if TYPE_CHECKING:
     from grbl_proxy.web.status import ProxyStatus
@@ -118,16 +118,47 @@ def create_router() -> APIRouter:
     async def upload_job(request: Request, file: UploadFile):
         cfg = _config(request)
         storage_dir = Path(cfg.job.storage_dir).expanduser()
+        original_filename = file.filename or None
 
-        async def _write():
+        content = await file.read()
+
+        def _write():
             storage_dir.mkdir(parents=True, exist_ok=True)
             dest = storage_dir / "uploaded.gcode"
-            content = await file.read()
             dest.write_bytes(content)
+            # Store original filename alongside so /api/job/start can retrieve it
+            if original_filename:
+                (storage_dir / "uploaded.filename").write_text(
+                    original_filename, encoding="utf-8"
+                )
             return content.count(b"\n")
 
         line_count = await asyncio.to_thread(_write)
-        return {"ok": True, "line_count": line_count}
+        return {"ok": True, "line_count": line_count, "filename": original_filename}
+
+    @router.post("/api/job/start")
+    async def start_job(request: Request):
+        cfg = _config(request)
+        storage_dir = Path(cfg.job.storage_dir).expanduser()
+        # Try to recover original filename from a sidecar file
+        sidecar = storage_dir / "uploaded.filename"
+        original_filename = None
+        if sidecar.exists():
+            try:
+                original_filename = sidecar.read_text(encoding="utf-8").strip() or None
+            except Exception:
+                pass
+        ok, reason = await _control(request).start_uploaded_job(
+            storage_dir, original_filename=original_filename
+        )
+        if not ok:
+            raise HTTPException(status_code=409, detail=reason)
+        if sidecar.exists():
+            try:
+                sidecar.unlink()
+            except Exception:
+                pass
+        return {"ok": True}
 
     @router.post("/api/job/pause")
     async def pause_job(request: Request):
@@ -164,6 +195,27 @@ def create_router() -> APIRouter:
         if not ok:
             raise HTTPException(status_code=409, detail=reason)
         return {"ok": True}
+
+    @router.get("/api/jobs")
+    async def get_jobs(request: Request):
+        from grbl_proxy.job_buffer import load_job_history
+        cfg = _config(request)
+        storage_dir = Path(cfg.job.storage_dir).expanduser()
+        return load_job_history(storage_dir, cfg.job.max_history)
+
+    @router.get("/api/jobs/{filename}/download")
+    async def download_job(request: Request, filename: str):
+        cfg = _config(request)
+        storage_dir = Path(cfg.job.storage_dir).expanduser()
+        # filename should be like "20250321_143022" (no extension)
+        gcode_path = storage_dir / f"{filename}.gcode"
+        if not gcode_path.exists():
+            raise HTTPException(status_code=404, detail="Job file not found")
+        return FileResponse(
+            path=str(gcode_path),
+            media_type="text/plain",
+            filename=f"{filename}.gcode",
+        )
 
     @router.get("/api/settings")
     async def get_settings(request: Request):

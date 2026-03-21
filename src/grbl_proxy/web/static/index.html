@@ -25,6 +25,10 @@
           <span id="grbl-state" class="value">—</span>
         </div>
         <div class="status-row">
+          <span class="label">Serial</span>
+          <span id="serial-connected" class="value">—</span>
+        </div>
+        <div class="status-row">
           <span class="label">Position (X, Y, Z)</span>
           <span id="position" class="value mono">—</span>
         </div>
@@ -58,6 +62,14 @@
         <button id="btn-resume" class="btn btn-success">Resume</button>
         <button id="btn-cancel" class="btn btn-danger">Cancel</button>
       </div>
+      <hr class="card-divider" />
+      <h3>Upload &amp; Run</h3>
+      <div class="upload-row">
+        <input type="file" id="gcode-file" accept=".gcode,.nc,.txt" />
+        <button id="btn-upload" class="btn btn-primary">Upload</button>
+        <button id="btn-run"    class="btn btn-success" disabled>Run</button>
+      </div>
+      <div id="upload-status" class="upload-status"></div>
     </section>
 
     <section class="card" id="console-card">
@@ -73,6 +85,23 @@
         <input id="console-input" type="text" placeholder="Send GRBL command…" autocomplete="off" />
         <button id="btn-send" class="btn btn-primary">Send</button>
       </div>
+    </section>
+    <section class="card" id="history-card">
+      <h2>Job History</h2>
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Date / Time</th>
+            <th>Source</th>
+            <th>Lines</th>
+            <th>Duration</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="history-body">
+          <tr><td colspan="5" class="history-empty">No completed jobs yet.</td></tr>
+        </tbody>
+      </table>
     </section>
   </main>
 

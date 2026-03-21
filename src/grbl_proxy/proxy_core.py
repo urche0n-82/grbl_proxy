@@ -140,6 +140,8 @@ class ProxyCore:
         self._serial_read_idle = asyncio.Event()
         self._serial_read_idle.set()  # idle by default (no one is reading)
         self._serial_yield = asyncio.Event()  # one-shot: tells _serial_to_tcp to stop reading
+        # Phase 5: idle poll task (sends ? to GRBL when no TCP client is connected)
+        self._idle_poll_task: asyncio.Task | None = None
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -469,6 +471,45 @@ class ProxyCore:
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
                 self._state = ProxyState.ERROR
 
+    # ------------------------------------------------------------------
+    # Phase 5: Idle GRBL status poll
+    # ------------------------------------------------------------------
+
+    def start_idle_poll(self, serial_conn: "SerialConnection", poll_hz: float = 1.0) -> None:
+        """Start a background task that sends '?' to GRBL at poll_hz rate.
+
+        Only runs when no LightBurn client is connected (DISCONNECTED or PASSTHROUGH).
+        The response is read by whoever owns the serial read path at that moment.
+        """
+        if self._idle_poll_task is not None:
+            return
+        self._idle_poll_task = asyncio.create_task(
+            self._idle_poll_loop(serial_conn, poll_hz), name="idle-poll"
+        )
+        logger.info("Idle GRBL poll started at %.1f Hz", poll_hz)
+
+    def stop_idle_poll(self) -> None:
+        """Stop the idle poll background task."""
+        if self._idle_poll_task is not None:
+            self._idle_poll_task.cancel()
+            self._idle_poll_task = None
+            logger.info("Idle GRBL poll stopped")
+
+    async def _idle_poll_loop(self, serial_conn: "SerialConnection", poll_hz: float) -> None:
+        interval = 1.0 / max(poll_hz, 0.1)
+        while True:
+            try:
+                await asyncio.sleep(interval)
+                # Only send when no active job and serial is connected
+                if self._state in (ProxyState.DISCONNECTED, ProxyState.PASSTHROUGH):
+                    if serial_conn.is_connected:
+                        try:
+                            await serial_conn.write(b"?")
+                        except Exception:
+                            pass
+            except asyncio.CancelledError:
+                break
+
     async def shutdown(self) -> None:
         """Cancel streamer task cleanly. Called by TcpServer.stop()."""
         if self._streamer_task is not None and not self._streamer_task.done():
@@ -509,7 +550,11 @@ class ProxyCore:
     async def _enter_buffering(self, writer: asyncio.StreamWriter) -> None:
         """Transition to BUFFERING and open the job buffer."""
         logger.info("Job start detected — entering Buffering state")
-        buf = JobBuffer(self._storage_dir, start_time=time.time())
+        buf = JobBuffer(
+            self._storage_dir,
+            start_time=time.time(),
+            max_history=self._cfg.max_history,
+        )
         try:
             await buf.open()
         except OSError as e:
