@@ -84,12 +84,13 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
         stop_event.set()
 
     loop.add_signal_handler(signal.SIGTERM, _request_stop, "SIGTERM")
+    loop.add_signal_handler(signal.SIGINT, _request_stop, "SIGINT")
 
     logger.info("grbl-proxy running. Press Ctrl-C to stop.")
 
     try:
         await stop_event.wait()
-    except (asyncio.CancelledError, KeyboardInterrupt):
+    except asyncio.CancelledError:
         pass
 
     logger.info("Shutting down...")
@@ -101,6 +102,7 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
     await asyncio.gather(reconnect_task, return_exceptions=True)
     logger.info("Shutdown: stopping TCP server")
     await tcp_server.stop()
+    logger.info("Shutdown: emergency stop")
     await proxy_core.emergency_stop(serial_conn)
     logger.info("Shutdown: disconnecting serial")
     await serial_conn.disconnect()
@@ -133,8 +135,6 @@ def run() -> None:
     loop.set_default_executor(executor)
     try:
         loop.run_until_complete(_main(config_path=args.config, debug=args.debug))
-    except KeyboardInterrupt:
-        pass
     finally:
         # Shut down executor without waiting for blocked threads to finish.
         # This allows the process to exit even if a serial.Serial() call is

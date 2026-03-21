@@ -486,12 +486,15 @@ class ProxyCore:
         serial port is closed, so writes still go through.
         """
         if self._state not in (ProxyState.EXECUTING, ProxyState.PAUSED):
+            logger.info("Emergency stop: no active job (state=%s), skipping", self._state.name)
             return
-        logger.warning("Emergency stop: sending M5 + soft reset to GRBL")
+        logger.warning("Emergency stop: active job detected (state=%s) — sending M5 + soft reset", self._state.name)
         try:
             await serial.write(b"M5\n")
+            logger.info("Emergency stop: M5 sent")
             await asyncio.sleep(0.05)  # let GRBL process M5 before reset clears queue
             await serial.write(b"\x18")  # soft reset — aborts all queued motion
+            logger.info("Emergency stop: soft reset sent")
         except Exception as e:
             logger.error("Emergency stop write failed: %s", e)
 
