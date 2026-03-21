@@ -137,11 +137,11 @@ def run() -> None:
     try:
         loop.run_until_complete(main_task)
     except KeyboardInterrupt:
-        # SIGINT hit a thread before add_signal_handler could fire.
-        # Set stop_event so _main's graceful shutdown sequence runs.
+        print("KeyboardInterrupt caught in run() — triggering graceful shutdown", flush=True)
         loop.call_soon_threadsafe(stop_event.set)
         loop.run_until_complete(main_task)
     finally:
+        print("run() finally block reached", flush=True)
         # Shut down executor without waiting for blocked threads to finish.
         # This allows the process to exit even if a serial.Serial() call is
         # stuck in a thread pool worker.
