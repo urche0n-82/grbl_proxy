@@ -101,6 +101,7 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
     await asyncio.gather(reconnect_task, return_exceptions=True)
     logger.info("Shutdown: stopping TCP server")
     await tcp_server.stop()
+    await proxy_core.emergency_stop(serial_conn)
     logger.info("Shutdown: disconnecting serial")
     await serial_conn.disconnect()
 

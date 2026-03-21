@@ -1,6 +1,8 @@
 # GRBL Proxy
 
-> **Early development — untested on hardware.** This project is a work in progress. APIs and configuration may change. Use at your own risk.
+> **Early development.** This project is a work in progress. APIs and configuration may change.
+>
+> **WARNING: This software controls laser cutting hardware. Use at your own risk.** The authors accept no liability for damage to equipment, materials, or injury caused by use of this software. Never leave a laser running unattended. Always power the laser off when not in use.
 
 A Raspberry Pi-based proxy that sits between [LightBurn](https://lightburnsoftware.com/) and a GRBL laser cutter (tested on the Creality Falcon 2 Pro), enabling disconnect-safe job execution and remote monitoring.
 

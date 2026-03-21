@@ -24,6 +24,7 @@ from grbl_proxy.grbl_protocol import StatusReport
 from grbl_proxy.job_buffer import JobBuffer, JobMetadata
 
 if TYPE_CHECKING:
+    from grbl_proxy.serial_conn import SerialConnection
     from grbl_proxy.streamer import GrblStreamer, StreamerResult
 
 logger = logging.getLogger(__name__)
@@ -477,6 +478,22 @@ class ProxyCore:
         self._streamer_task = None
         self._serial_yield.clear()
         self._serial_readable.set()
+
+    async def emergency_stop(self, serial: "SerialConnection") -> None:
+        """Send laser kill sequence to GRBL if a job was active during shutdown.
+
+        Called after shutdown() (streamer already cancelled) but before the
+        serial port is closed, so writes still go through.
+        """
+        if self._state not in (ProxyState.EXECUTING, ProxyState.PAUSED):
+            return
+        logger.warning("Emergency stop: sending M5 + soft reset to GRBL")
+        try:
+            await serial.write(b"M5\n")
+            await asyncio.sleep(0.05)  # let GRBL process M5 before reset clears queue
+            await serial.write(b"\x18")  # soft reset — aborts all queued motion
+        except Exception as e:
+            logger.error("Emergency stop write failed: %s", e)
 
     # ------------------------------------------------------------------
     # Internal helpers
