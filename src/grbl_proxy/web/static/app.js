@@ -106,6 +106,7 @@ async function jobAction(action) {
 // ---------------------------------------------------------------------------
 
 let consoleAutoScroll = true;
+let lastConsoleTimestamp = 0;
 
 function isStatusResponse(text) {
   // GRBL status reports: <Idle|MPos:...> or <Run|...> etc.
@@ -117,18 +118,36 @@ function hideStatusEnabled() {
 }
 
 async function loadConsole() {
+  // Initial load: fetch last 100 entries and render from scratch
   try {
     const resp = await fetch("/api/console?n=100");
     const lines = await resp.json();
     const el = $("console-log");
     el.innerHTML = "";
+    lastConsoleTimestamp = 0;
     lines.forEach(appendConsoleLine);
   } catch (e) {
     console.warn("console load error", e);
   }
 }
 
+async function pollConsole() {
+  // Incremental poll: fetch all entries, append only ones newer than last seen
+  try {
+    const resp = await fetch("/api/console?n=200");
+    const lines = await resp.json();
+    lines.forEach((entry) => {
+      if (entry.t > lastConsoleTimestamp) {
+        appendConsoleLine(entry);
+      }
+    });
+  } catch (e) {
+    console.warn("console poll error", e);
+  }
+}
+
 function appendConsoleLine(entry) {
+  if (entry.t > lastConsoleTimestamp) lastConsoleTimestamp = entry.t;
   if (hideStatusEnabled() && entry.dir === "rx" && isStatusResponse(entry.text)) return;
 
   const el = $("console-log");
@@ -180,7 +199,7 @@ $("console-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendConsole();
 });
 
-// Re-render console immediately when the toggle changes
+// Re-render console from scratch when the toggle changes (filter affects all lines)
 $("hide-status").addEventListener("change", loadConsole);
 
 // Pause auto-scroll when user scrolls up
@@ -196,5 +215,5 @@ $("console-log").addEventListener("scroll", (e) => {
 connectWS();
 loadConsole();
 
-// Refresh console log periodically (WebSocket handles machine state)
-setInterval(loadConsole, 5000);
+// Poll for new console entries and append only the new ones
+setInterval(pollConsole, 1000);
