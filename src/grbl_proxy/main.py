@@ -85,7 +85,7 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
     web_task = None
     if _WEB_AVAILABLE:
         proxy_status = ProxyStatus(proxy_core)
-        proxy_control = ProxyControl(proxy_core)
+        proxy_control = ProxyControl(proxy_core, serial_conn=serial_conn)
         console_log = ConsoleLog()
         logging.getLogger("grbl_proxy.tcp_server").addHandler(
             _ConsoleLogHandler(console_log)

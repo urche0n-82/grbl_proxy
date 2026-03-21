@@ -104,10 +104,19 @@ class ProxyControl:
 
     Each method checks state preconditions and follows the exact same
     code paths as process_raw_byte to avoid double-transition bugs.
+
+    serial_conn is injected directly so that pause/resume/cancel work even
+    when no LightBurn client is connected (ProxyCore._serial_conn is only
+    populated lazily on the first TCP byte received).
     """
 
-    def __init__(self, core: "ProxyCore") -> None:
+    def __init__(self, core: "ProxyCore", serial_conn=None) -> None:
         self._core = core
+        self._serial = serial_conn
+
+    def _serial_conn(self):
+        """Return the best available serial connection reference."""
+        return self._serial or self._core._serial_conn
 
     async def pause(self) -> tuple[bool, str]:
         """Send feed hold. Valid only in EXECUTING state."""
@@ -119,9 +128,10 @@ class ProxyControl:
         if core._streamer is not None:
             core._streamer.pause()
         core._state = ProxyState.PAUSED
-        if core._serial_conn is not None:
+        serial = self._serial_conn()
+        if serial is not None:
             try:
-                await core._serial_conn.write(b"!")
+                await serial.write(b"!")
             except Exception:
                 pass
         return True, "ok"
@@ -136,9 +146,10 @@ class ProxyControl:
         if core._streamer is not None:
             core._streamer.resume()
         core._state = ProxyState.EXECUTING
-        if core._serial_conn is not None:
+        serial = self._serial_conn()
+        if serial is not None:
             try:
-                await core._serial_conn.write(b"~")
+                await serial.write(b"~")
             except Exception:
                 pass
         return True, "ok"
@@ -153,9 +164,10 @@ class ProxyControl:
         if core._streamer is not None:
             core._streamer.cancel()
         # Write soft-reset — _on_streamer_done handles the state transition.
-        if core._serial_conn is not None:
+        serial = self._serial_conn()
+        if serial is not None:
             try:
-                await core._serial_conn.write(b"\x18")
+                await serial.write(b"\x18")
             except Exception:
                 pass
         return True, "ok"
@@ -167,11 +179,12 @@ class ProxyControl:
         core = self._core
         if core._state != ProxyState.PASSTHROUGH:
             return False, f"Cannot send console command in state {core._state.value}"
-        if core._serial_conn is None:
+        serial = self._serial_conn()
+        if serial is None:
             return False, "No serial connection"
         cmd = command.strip()
         try:
-            await core._serial_conn.write((cmd + "\n").encode())
+            await serial.write((cmd + "\n").encode())
         except Exception as e:
             return False, str(e)
         logger.debug("Web→Serial: %s", cmd)
