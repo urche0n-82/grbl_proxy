@@ -169,6 +169,12 @@ async function sendConsole() {
   }
 }
 
+// Button event listeners
+$("btn-pause").addEventListener("click",  () => jobAction("pause"));
+$("btn-resume").addEventListener("click", () => jobAction("resume"));
+$("btn-cancel").addEventListener("click", () => jobAction("cancel"));
+$("btn-send").addEventListener("click", sendConsole);
+
 // Allow Enter key in console input
 $("console-input").addEventListener("keydown", (e) => {
   if (e.key === "Enter") sendConsole();

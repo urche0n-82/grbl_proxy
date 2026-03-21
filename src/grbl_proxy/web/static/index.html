@@ -54,9 +54,9 @@
         </div>
       </div>
       <div class="button-row">
-        <button id="btn-pause"  class="btn btn-warning" onclick="jobAction('pause')">Pause</button>
-        <button id="btn-resume" class="btn btn-success" onclick="jobAction('resume')">Resume</button>
-        <button id="btn-cancel" class="btn btn-danger"  onclick="jobAction('cancel')">Cancel</button>
+        <button id="btn-pause"  class="btn btn-warning">Pause</button>
+        <button id="btn-resume" class="btn btn-success">Resume</button>
+        <button id="btn-cancel" class="btn btn-danger">Cancel</button>
       </div>
     </section>
 
@@ -71,7 +71,7 @@
       <div id="console-log" class="console-log"></div>
       <div class="console-input-row">
         <input id="console-input" type="text" placeholder="Send GRBL command…" autocomplete="off" />
-        <button class="btn btn-primary" onclick="sendConsole()">Send</button>
+        <button id="btn-send" class="btn btn-primary">Send</button>
       </div>
     </section>
   </main>
