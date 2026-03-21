@@ -485,7 +485,7 @@ class ProxyCore:
         Called after shutdown() (streamer already cancelled) but before the
         serial port is closed, so writes still go through.
         """
-        if self._state not in (ProxyState.EXECUTING, ProxyState.PAUSED):
+        if self._state not in (ProxyState.EXECUTING, ProxyState.PAUSED, ProxyState.ERROR):
             logger.info("Emergency stop: no active job (state=%s), skipping", self._state.name)
             return
         logger.warning("Emergency stop: active job detected (state=%s) — sending M5 + soft reset", self._state.name)
