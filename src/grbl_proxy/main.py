@@ -131,6 +131,16 @@ def run() -> None:
     loop = asyncio.new_event_loop()
     loop.set_default_executor(executor)
     stop_event = asyncio.Event()
+
+    # Install a synchronous SIGINT handler BEFORE the event loop starts.
+    # This fires on the main thread regardless of what threads are running,
+    # and sets stop_event so _main's graceful shutdown sequence runs.
+    def _sigint_handler(_sig, _frame):
+        print("SIGINT received — requesting graceful shutdown", flush=True)
+        loop.call_soon_threadsafe(stop_event.set)
+
+    signal.signal(signal.SIGINT, _sigint_handler)
+
     main_task = loop.create_task(
         _main(config_path=args.config, debug=args.debug, stop_event=stop_event)
     )
