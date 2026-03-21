@@ -35,7 +35,7 @@ def _setup_logging(debug: bool = False) -> None:
     logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 
-async def _main(config_path: Path | None = None, debug: bool = False) -> None:
+async def _main(config_path: Path | None = None, debug: bool = False, stop_event: asyncio.Event | None = None) -> None:
     _setup_logging(debug)
 
     config = load_config(config_path)
@@ -72,12 +72,9 @@ async def _main(config_path: Path | None = None, debug: bool = False) -> None:
         return
 
     # Graceful shutdown on SIGTERM (systemd) or SIGINT (Ctrl-C).
-    # SIGTERM uses loop.add_signal_handler (no default behaviour to preserve).
-    # SIGINT is left as default so KeyboardInterrupt propagates through the
-    # event loop normally — add_signal_handler suppresses it and can miss
-    # signals when a thread holds the GIL (e.g. blocking serial.Serial()).
     loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
+    if stop_event is None:
+        stop_event = asyncio.Event()
 
     def _request_stop(sig_name: str) -> None:
         logger.info("Received %s, shutting down...", sig_name)
@@ -133,8 +130,17 @@ def run() -> None:
     executor = concurrent.futures.ThreadPoolExecutor(thread_name_prefix="grbl-proxy")
     loop = asyncio.new_event_loop()
     loop.set_default_executor(executor)
+    stop_event = asyncio.Event()
+    main_task = loop.create_task(
+        _main(config_path=args.config, debug=args.debug, stop_event=stop_event)
+    )
     try:
-        loop.run_until_complete(_main(config_path=args.config, debug=args.debug))
+        loop.run_until_complete(main_task)
+    except KeyboardInterrupt:
+        # SIGINT hit a thread before add_signal_handler could fire.
+        # Set stop_event so _main's graceful shutdown sequence runs.
+        loop.call_soon_threadsafe(stop_event.set)
+        loop.run_until_complete(main_task)
     finally:
         # Shut down executor without waiting for blocked threads to finish.
         # This allows the process to exit even if a serial.Serial() call is
