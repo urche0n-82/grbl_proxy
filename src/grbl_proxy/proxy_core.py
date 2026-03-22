@@ -521,12 +521,21 @@ class ProxyCore:
         """Read all pending lines from serial, logging each so ConsoleLog picks them up.
 
         Used when in DISCONNECTED state (no TCP client) where _serial_to_tcp is not
-        running. Reads until the serial port is quiet (timeout) or state changes.
+        running. Reads until the serial port returns an empty line (its built-in
+        READLINE_TIMEOUT fired) or the state changes.
+
+        IMPORTANT: Must NOT use asyncio.wait_for() here. read_line() dispatches to a
+        thread via asyncio.to_thread(); cancelling the coroutine via wait_for does not
+        stop the underlying thread, leaving a dangling reader that races with the next
+        call and produces split/interleaved lines.
         """
         while self._state == ProxyState.DISCONNECTED:
             try:
-                line = await asyncio.wait_for(serial_conn.read_line(), timeout=0.15)
-            except (asyncio.TimeoutError, Exception):
+                line = await serial_conn.read_line()
+            except Exception:
+                break
+            if not line:
+                # Empty string = serial readline timeout, port is quiet
                 break
             # Log in the same format _serial_to_tcp uses so _ConsoleLogHandler
             # captures it into the web console ring buffer.
