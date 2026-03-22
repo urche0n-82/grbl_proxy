@@ -87,6 +87,12 @@ function applySnapshot(s) {
   const paused    = s.proxy_state === "Paused";
   const active    = executing || paused;
   updateJobControls(active, executing, paused);
+
+  // Machine buttons — only usable when serial is connected and no job running
+  const serialOk  = !!s.serial_connected;
+  const alarm     = s.grbl_state === "Alarm";
+  $("btn-home").disabled         = !serialOk || active;
+  $("btn-cancel-alarm").disabled = !serialOk || !alarm;
 }
 
 // Delegated listener on #job-controls — survives innerHTML swaps
@@ -210,6 +216,18 @@ function escapeHtml(str) {
     .replace(/>/g, "&gt;");
 }
 
+async function sendCommand(cmd) {
+  try {
+    await fetch("/api/console", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command: cmd }),
+    });
+  } catch (e) {
+    console.error("sendCommand error", e);
+  }
+}
+
 async function sendConsole() {
   const input = $("console-input");
   const command = input.value.trim();
@@ -225,6 +243,9 @@ async function sendConsole() {
     console.error("sendConsole error", e);
   }
 }
+
+$("btn-home").addEventListener("click",         () => sendCommand("$H"));
+$("btn-cancel-alarm").addEventListener("click", () => sendCommand("$X"));
 
 $("btn-send").addEventListener("click", sendConsole);
 
