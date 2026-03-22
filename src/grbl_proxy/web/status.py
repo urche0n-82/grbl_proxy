@@ -247,11 +247,11 @@ class ProxyControl:
         return True, "ok"
 
     async def send_console(self, command: str) -> tuple[bool, str]:
-        """Send an arbitrary command to GRBL. Valid only in PASSTHROUGH state."""
+        """Send an arbitrary command to GRBL. Valid in PASSTHROUGH or DISCONNECTED state."""
         from grbl_proxy.proxy_core import ProxyState
 
         core = self._core
-        if core._state != ProxyState.PASSTHROUGH:
+        if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED):
             return False, f"Cannot send console command in state {core._state.value}"
         serial = self._serial_conn()
         if serial is None:

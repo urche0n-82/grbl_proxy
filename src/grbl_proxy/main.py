@@ -93,6 +93,9 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
         logging.getLogger("grbl_proxy.web.status").addHandler(
             _ConsoleLogHandler(console_log)
         )
+        logging.getLogger("grbl_proxy.proxy_core").addHandler(
+            _ConsoleLogHandler(console_log)
+        )
         web_app = create_app(proxy_status, proxy_control, console_log, config)
         uv_server = uvicorn.Server(
             uvicorn.Config(

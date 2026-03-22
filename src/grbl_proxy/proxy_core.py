@@ -501,14 +501,40 @@ class ProxyCore:
             try:
                 await asyncio.sleep(interval)
                 # Only send when no active job and serial is connected
-                if self._state in (ProxyState.DISCONNECTED, ProxyState.PASSTHROUGH):
-                    if serial_conn.is_connected:
-                        try:
-                            await serial_conn.write(b"?")
-                        except Exception:
-                            pass
+                if self._state not in (ProxyState.DISCONNECTED, ProxyState.PASSTHROUGH):
+                    continue
+                if not serial_conn.is_connected:
+                    continue
+                try:
+                    await serial_conn.write(b"?")
+                except Exception:
+                    continue
+                # When no TCP client is connected, _serial_to_tcp isn't running so
+                # we must read and parse responses ourselves. Drain all pending lines
+                # so web console commands also get their replies captured.
+                if self._state == ProxyState.DISCONNECTED:
+                    await self._drain_serial(serial_conn)
             except asyncio.CancelledError:
                 break
+
+    async def _drain_serial(self, serial_conn: "SerialConnection") -> None:
+        """Read all pending lines from serial, logging each so ConsoleLog picks them up.
+
+        Used when in DISCONNECTED state (no TCP client) where _serial_to_tcp is not
+        running. Reads until the serial port is quiet (timeout) or state changes.
+        """
+        while self._state == ProxyState.DISCONNECTED:
+            try:
+                line = await asyncio.wait_for(serial_conn.read_line(), timeout=0.15)
+            except (asyncio.TimeoutError, Exception):
+                break
+            # Log in the same format _serial_to_tcp uses so _ConsoleLogHandler
+            # captures it into the web console ring buffer.
+            logger.debug("Serial→TCP: %r", (line + "\n").encode())
+            if grbl_protocol.is_status_report(line):
+                status = grbl_protocol.parse_status_report(line)
+                if status:
+                    self.update_last_status(status)
 
     async def shutdown(self) -> None:
         """Cancel streamer task cleanly. Called by TcpServer.stop()."""
