@@ -247,11 +247,11 @@ class ProxyControl:
         return True, "ok"
 
     async def send_console(self, command: str) -> tuple[bool, str]:
-        """Send an arbitrary command to GRBL. Valid in PASSTHROUGH or DISCONNECTED state."""
+        """Send an arbitrary command to GRBL. Valid in PASSTHROUGH, DISCONNECTED, or ERROR state."""
         from grbl_proxy.proxy_core import ProxyState
 
         core = self._core
-        if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED):
+        if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED, ProxyState.ERROR):
             return False, f"Cannot send console command in state {core._state.value}"
         serial = self._serial_conn()
         if serial is None:
@@ -262,4 +262,9 @@ class ProxyControl:
         except Exception as e:
             return False, str(e)
         logger.debug("Web→Serial: %s", cmd)
+        # Clear error state when operator sends $X (unlock) or $H (home)
+        if core._state == ProxyState.ERROR and cmd.upper() in ("$X", "$H"):
+            logger.info("Error cleared via %s (web console) — returning to Disconnected", cmd)
+            core._state = ProxyState.DISCONNECTED
+            core._last_error = None
         return True, "ok"
