@@ -235,8 +235,10 @@ async function uploadFile() {
     if (resp.ok) {
       const data = await resp.json();
       $("upload-status").textContent = `Uploaded: ${file.name} (${data.line_count} lines)`;
+      setQueuedFile(file.name);
       $("btn-run").disabled = false;
       $("btn-run").dataset.filename = file.name;
+      await loadFiles();  // refresh file list to show the new upload
     } else {
       const body = await resp.json().catch(() => ({}));
       $("upload-status").textContent = `Upload failed: ${body.detail ?? resp.status}`;
@@ -252,6 +254,8 @@ async function runUploaded() {
     if (resp.ok) {
       $("upload-status").textContent = "Job started.";
       $("btn-run").disabled = true;
+      setQueuedFile(null);
+      await loadFiles();
     } else {
       const body = await resp.json().catch(() => ({}));
       $("upload-status").textContent = `Start failed: ${body.detail ?? resp.status}`;
@@ -261,8 +265,105 @@ async function runUploaded() {
   }
 }
 
+function setQueuedFile(name) {
+  const el = $("queued-file");
+  el.textContent = name ? `Queued: ${name}` : "";
+}
+
 $("btn-upload").addEventListener("click", uploadFile);
 $("btn-run").addEventListener("click", runUploaded);
+
+// ---------------------------------------------------------------------------
+// Files widget
+// ---------------------------------------------------------------------------
+
+let selectedFileStem = null;
+
+function formatBytes(n) {
+  if (n == null) return "";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+async function loadFiles() {
+  try {
+    const resp = await fetch("/api/files");
+    const files = await resp.json();
+    renderFiles(files);
+  } catch (e) {
+    console.warn("files load error", e);
+  }
+}
+
+function renderFiles(files) {
+  const ul = $("files-list");
+  if (!files.length) {
+    ul.innerHTML = '<li class="files-empty">No files stored yet.</li>';
+    return;
+  }
+  ul.innerHTML = "";
+  for (const f of files) {
+    const li = document.createElement("li");
+    li.className = "file-item" + (f.stem === selectedFileStem ? " selected" : "");
+    li.dataset.stem = f.stem;
+
+    const lines = f.line_count != null ? `${f.line_count} lines` : formatBytes(f.size_bytes);
+    li.innerHTML =
+      `<span class="file-name" title="${escapeHtml(f.display_name)}">${escapeHtml(f.display_name)}</span>` +
+      `<span class="file-meta">${escapeHtml(lines)}</span>` +
+      `<button class="btn-trash" title="Delete" data-stem="${escapeHtml(f.stem)}">🗑</button>`;
+
+    li.addEventListener("click", (e) => {
+      if (e.target.classList.contains("btn-trash")) return;
+      selectFile(f.stem, f.display_name);
+    });
+    li.querySelector(".btn-trash").addEventListener("click", (e) => {
+      e.stopPropagation();
+      deleteFile(f.stem, f.display_name);
+    });
+
+    ul.appendChild(li);
+  }
+}
+
+async function selectFile(stem, displayName) {
+  try {
+    const resp = await fetch(`/api/files/${encodeURIComponent(stem)}/select`, { method: "POST" });
+    if (resp.ok) {
+      selectedFileStem = stem;
+      setQueuedFile(displayName);
+      $("btn-run").disabled = false;
+      $("upload-status").textContent = "";
+      await loadFiles();  // re-render to update selected highlight
+    } else {
+      const body = await resp.json().catch(() => ({}));
+      console.warn("select failed:", body.detail ?? resp.status);
+    }
+  } catch (e) {
+    console.error("selectFile error", e);
+  }
+}
+
+async function deleteFile(stem, displayName) {
+  if (!confirm(`Delete "${displayName}"?`)) return;
+  try {
+    const resp = await fetch(`/api/files/${encodeURIComponent(stem)}`, { method: "DELETE" });
+    if (resp.ok) {
+      if (stem === selectedFileStem) {
+        selectedFileStem = null;
+        setQueuedFile(null);
+        $("btn-run").disabled = true;
+      }
+      await loadFiles();
+    } else {
+      const body = await resp.json().catch(() => ({}));
+      console.warn("delete failed:", body.detail ?? resp.status);
+    }
+  } catch (e) {
+    console.error("deleteFile error", e);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Job History
@@ -308,8 +409,11 @@ async function loadHistory() {
 connectWS();
 loadConsole();
 loadHistory();
+loadFiles();
 
 // Poll for new console entries and append only the new ones
 setInterval(pollConsole, 1000);
 // Refresh history every 30s
 setInterval(loadHistory, 30000);
+// Refresh file list every 10s
+setInterval(loadFiles, 10000);

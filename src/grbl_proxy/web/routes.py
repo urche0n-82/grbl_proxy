@@ -217,6 +217,108 @@ def create_router() -> APIRouter:
             filename=f"{filename}.gcode",
         )
 
+    @router.get("/api/files")
+    async def list_files(request: Request):
+        """List all .gcode files in storage dir, newest-modified first.
+
+        Returns each file as:
+          { stem, display_name, size_bytes, line_count, modified }
+        'uploaded' is the staged-but-not-yet-run file (stem == "uploaded").
+        All others are timestamp-named completed/historical jobs.
+        """
+        cfg = _config(request)
+        storage_dir = Path(cfg.job.storage_dir).expanduser()
+        if not storage_dir.exists():
+            return []
+
+        def _scan():
+            results = []
+            for p in sorted(storage_dir.glob("*.gcode"), key=lambda f: f.stat().st_mtime, reverse=True):
+                stem = p.stem
+                stat = p.stat()
+                # Prefer original_filename from sidecar (uploaded.filename) or meta JSON
+                display_name = stem
+                sidecar = storage_dir / "uploaded.filename"
+                meta_path = storage_dir / f"{stem}.meta.json"
+                if stem == "uploaded" and sidecar.exists():
+                    try:
+                        display_name = sidecar.read_text(encoding="utf-8").strip() or stem
+                    except Exception:
+                        pass
+                elif meta_path.exists():
+                    try:
+                        import json as _json
+                        meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+                        display_name = meta.get("original_filename") or stem
+                    except Exception:
+                        pass
+                line_count = None
+                try:
+                    line_count = p.read_bytes().count(b"\n")
+                except Exception:
+                    pass
+                results.append({
+                    "stem": stem,
+                    "display_name": display_name,
+                    "size_bytes": stat.st_size,
+                    "line_count": line_count,
+                    "modified": stat.st_mtime,
+                })
+            return results
+
+        return await asyncio.to_thread(_scan)
+
+    @router.delete("/api/files/{stem}")
+    async def delete_file(request: Request, stem: str):
+        """Delete a stored .gcode file (and its sidecar/meta if present)."""
+        cfg = _config(request)
+        storage_dir = Path(cfg.job.storage_dir).expanduser()
+        gcode_path = storage_dir / f"{stem}.gcode"
+        if not gcode_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+
+        def _delete():
+            gcode_path.unlink(missing_ok=True)
+            (storage_dir / f"{stem}.meta.json").unlink(missing_ok=True)
+            if stem == "uploaded":
+                (storage_dir / "uploaded.filename").unlink(missing_ok=True)
+
+        await asyncio.to_thread(_delete)
+        return {"ok": True}
+
+    @router.post("/api/files/{stem}/select")
+    async def select_file(request: Request, stem: str):
+        """Stage an existing stored file as the next job to run.
+
+        Copies {stem}.gcode → uploaded.gcode and records the display name in
+        uploaded.filename so /api/job/start picks it up normally.
+        """
+        import shutil as _shutil
+        cfg = _config(request)
+        storage_dir = Path(cfg.job.storage_dir).expanduser()
+        src = storage_dir / f"{stem}.gcode"
+        if not src.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+
+        def _select():
+            dest = storage_dir / "uploaded.gcode"
+            _shutil.copy2(str(src), str(dest))
+            # Derive display name from meta if available
+            meta_path = storage_dir / f"{stem}.meta.json"
+            display_name = stem
+            if meta_path.exists():
+                try:
+                    import json as _json
+                    meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+                    display_name = meta.get("original_filename") or stem
+                except Exception:
+                    pass
+            (storage_dir / "uploaded.filename").write_text(display_name, encoding="utf-8")
+            return display_name
+
+        display_name = await asyncio.to_thread(_select)
+        return {"ok": True, "display_name": display_name}
+
     @router.get("/api/settings")
     async def get_settings(request: Request):
         cfg = _config(request)

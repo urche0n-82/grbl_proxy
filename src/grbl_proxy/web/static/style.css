@@ -207,6 +207,75 @@ main {
   min-height: 1.2em;
 }
 
+/* Files widget */
+.files-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.files-empty {
+  color: var(--muted);
+  font-size: 0.85em;
+  padding: 8px 0;
+}
+
+.file-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  cursor: pointer;
+  transition: background 0.12s;
+}
+.file-item:hover { background: var(--bg); }
+.file-item.selected {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+}
+
+.file-name {
+  flex: 1;
+  font-size: 0.85em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.file-meta {
+  font-size: 0.78em;
+  color: var(--muted);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.btn-trash {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 1em;
+  padding: 2px 4px;
+  border-radius: 3px;
+  line-height: 1;
+  flex-shrink: 0;
+  transition: color 0.12s;
+}
+.btn-trash:hover { color: var(--danger); }
+
+.queued-file {
+  margin-top: 6px;
+  font-size: 0.82em;
+  color: var(--accent);
+  min-height: 1.2em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Job History */
 #history-card { grid-column: 1 / -1; }
 
