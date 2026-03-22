@@ -142,6 +142,8 @@ class ProxyCore:
         self._serial_yield = asyncio.Event()  # one-shot: tells _serial_to_tcp to stop reading
         # Phase 5: idle poll task (sends ? to GRBL when no TCP client is connected)
         self._idle_poll_task: asyncio.Task | None = None
+        # True whenever a LightBurn TCP client is currently connected
+        self._has_tcp_client: bool = False
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -149,6 +151,7 @@ class ProxyCore:
 
     def on_client_connected(self) -> None:
         """Call when LightBurn establishes a TCP connection."""
+        self._has_tcp_client = True
         if self._state == ProxyState.BUFFERING and self._buffer is not None:
             # Fire-and-forget discard — we can't await here
             asyncio.ensure_future(self._buffer.discard())
@@ -169,6 +172,7 @@ class ProxyCore:
 
     async def on_client_disconnected(self) -> None:
         """Call when the LightBurn TCP connection drops. Idempotent."""
+        self._has_tcp_client = False
         if self._state == ProxyState.DISCONNECTED:
             return  # already handled (double-call guard)
         if self._state == ProxyState.BUFFERING and self._buffer is not None:
