@@ -453,7 +453,10 @@ class ProxyCore:
                 result.total_lines,
             )
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
-                self._state = ProxyState.PASSTHROUGH
+                self._state = (
+                    ProxyState.PASSTHROUGH if self._has_tcp_client
+                    else ProxyState.DISCONNECTED
+                )
         else:
             if result.alarm_code is not None:
                 logger.error(
@@ -473,7 +476,7 @@ class ProxyCore:
                 )
             self._last_error = result
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
-                self._state = ProxyState.ERROR
+                self._state = ProxyState.ERROR  # ERROR regardless of TCP client presence
 
     # ------------------------------------------------------------------
     # Phase 5: Idle GRBL status poll
