@@ -168,6 +168,7 @@ class ProxyControl:
         core = self._core
         if core._state not in (ProxyState.EXECUTING, ProxyState.PAUSED):
             return False, f"No active job in state {core._state.value}"
+        core._user_cancelled = True
         if core._streamer is not None:
             core._streamer.cancel()
         # Write soft-reset — _on_streamer_done handles the state transition.

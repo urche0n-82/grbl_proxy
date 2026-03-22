@@ -144,6 +144,9 @@ class ProxyCore:
         self._idle_poll_task: asyncio.Task | None = None
         # True whenever a LightBurn TCP client is currently connected
         self._has_tcp_client: bool = False
+        # Set by an explicit user cancel (web UI) so _on_streamer_done can
+        # distinguish intentional cancel from unexpected abort (serial disconnect etc.)
+        self._user_cancelled: bool = False
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -413,6 +416,7 @@ class ProxyCore:
         """Create and launch the GrblStreamer task."""
         from grbl_proxy.streamer import GrblStreamer  # lazy import avoids circular
 
+        self._user_cancelled = False  # clear any stale flag from a previous job
         if self._serial_conn is None:
             # No serial connection cached — cannot execute. Fall back to passthrough.
             logger.error(
@@ -446,17 +450,24 @@ class ProxyCore:
         self._serial_yield.clear()
         self._serial_readable.set()  # restore serial to _serial_to_tcp
 
-        if result.completed:
-            logger.info(
-                "Streaming complete: %d/%d lines sent",
-                result.lines_sent,
-                result.total_lines,
-            )
-            if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
-                self._state = (
-                    ProxyState.PASSTHROUGH if self._has_tcp_client
-                    else ProxyState.DISCONNECTED
+        idle_state = ProxyState.PASSTHROUGH if self._has_tcp_client else ProxyState.DISCONNECTED
+        user_cancelled = self._user_cancelled
+        self._user_cancelled = False  # reset for next job
+
+        if result.completed or user_cancelled:
+            if result.completed:
+                logger.info(
+                    "Streaming complete: %d/%d lines sent",
+                    result.lines_sent,
+                    result.total_lines,
                 )
+            else:
+                logger.warning(
+                    "Job cancelled by user after %d lines.",
+                    result.lines_sent,
+                )
+            if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
+                self._state = idle_state
         else:
             if result.alarm_code is not None:
                 logger.error(
@@ -469,14 +480,9 @@ class ProxyCore:
                     result.error_code,
                     result.error_line,
                 )
-            else:
-                logger.warning(
-                    "Job cancelled after %d lines — proxy in ERROR state.",
-                    result.lines_sent,
-                )
             self._last_error = result
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
-                self._state = ProxyState.ERROR  # ERROR regardless of TCP client presence
+                self._state = ProxyState.ERROR
 
     # ------------------------------------------------------------------
     # Phase 5: Idle GRBL status poll
