@@ -235,6 +235,8 @@ def create_router() -> APIRouter:
             results = []
             for p in sorted(storage_dir.glob("*.gcode"), key=lambda f: f.stat().st_mtime, reverse=True):
                 stem = p.stem
+                if stem == "current":
+                    continue  # in-progress LightBurn capture, not user-visible
                 stat = p.stat()
                 # Prefer original_filename from sidecar (uploaded.filename) or meta JSON
                 display_name = stem
@@ -301,9 +303,17 @@ def create_router() -> APIRouter:
             raise HTTPException(status_code=404, detail="File not found")
 
         def _select():
+            # If selecting the already-staged file, skip the copy
             dest = storage_dir / "uploaded.gcode"
-            _shutil.copy2(str(src), str(dest))
-            # Derive display name from meta if available
+            if src != dest:
+                _shutil.copy2(str(src), str(dest))
+            # Derive display name: sidecar for uploaded, meta JSON for timestamped files
+            sidecar = storage_dir / "uploaded.filename"
+            if stem == "uploaded" and sidecar.exists():
+                try:
+                    return sidecar.read_text(encoding="utf-8").strip() or stem
+                except Exception:
+                    return stem
             meta_path = storage_dir / f"{stem}.meta.json"
             display_name = stem
             if meta_path.exists():
