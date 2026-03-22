@@ -80,12 +80,34 @@ function applySnapshot(s) {
     $("job-elapsed").textContent = "—";
   }
 
-  // Enable/disable control buttons based on state
+  // Swap Job controls based on state
   const executing = s.proxy_state === "Executing";
   const paused    = s.proxy_state === "Paused";
-  $("btn-pause").disabled  = !executing;
-  $("btn-resume").disabled = !paused;
-  $("btn-cancel").disabled = !(executing || paused);
+  const active    = executing || paused;
+  updateJobControls(active, executing, paused);
+}
+
+function updateJobControls(active, executing, paused) {
+  const row = $("job-controls");
+  if (active) {
+    // Show Pause / Resume / Cancel; hide Run
+    row.innerHTML =
+      `<button id="btn-pause"  class="btn btn-warning">Pause</button>` +
+      `<button id="btn-resume" class="btn btn-success">Resume</button>` +
+      `<button id="btn-cancel" class="btn btn-danger">Cancel</button>`;
+    $("btn-pause").disabled  = !executing;
+    $("btn-resume").disabled = !paused;
+    $("btn-cancel").disabled = false;
+    $("btn-pause").addEventListener("click",  () => jobAction("pause"));
+    $("btn-resume").addEventListener("click", () => jobAction("resume"));
+    $("btn-cancel").addEventListener("click", () => jobAction("cancel"));
+  } else {
+    // Show Run button; enabled only if a file is queued
+    const hasQueued = selectedFileStem !== null;
+    row.innerHTML =
+      `<button id="btn-run" class="btn btn-success"${hasQueued ? "" : " disabled"}>Run</button>`;
+    $("btn-run").addEventListener("click", runQueued);
+  }
 }
 
 function formatDuration(secs) {
@@ -197,10 +219,9 @@ async function sendConsole() {
   }
 }
 
-// Button event listeners
-$("btn-pause").addEventListener("click",  () => jobAction("pause"));
-$("btn-resume").addEventListener("click", () => jobAction("resume"));
-$("btn-cancel").addEventListener("click", () => jobAction("cancel"));
+// Initial Run button listener (before any WS snapshot swaps it)
+$("btn-run").addEventListener("click", runQueued);
+
 $("btn-send").addEventListener("click", sendConsole);
 
 // Allow Enter key in console input
@@ -218,66 +239,74 @@ $("console-log").addEventListener("scroll", (e) => {
 });
 
 // ---------------------------------------------------------------------------
-// Upload & Run
+// Run queued file
 // ---------------------------------------------------------------------------
 
-async function uploadFile() {
-  const fileInput = $("gcode-file");
-  const file = fileInput.files[0];
-  if (!file) {
-    $("upload-status").textContent = "Select a file first.";
-    return;
-  }
-  const formData = new FormData();
-  formData.append("file", file);
-  try {
-    const resp = await fetch("/api/job", { method: "POST", body: formData });
-    if (resp.ok) {
-      const data = await resp.json();
-      $("upload-status").textContent = `Uploaded: ${file.name} (${data.line_count} lines)`;
-      setQueuedFile(file.name);
-      $("btn-run").disabled = false;
-      $("btn-run").dataset.filename = file.name;
-      await loadFiles();  // refresh file list to show the new upload
-    } else {
-      const body = await resp.json().catch(() => ({}));
-      $("upload-status").textContent = `Upload failed: ${body.detail ?? resp.status}`;
-    }
-  } catch (e) {
-    $("upload-status").textContent = `Upload error: ${e.message}`;
-  }
-}
-
-async function runUploaded() {
+async function runQueued() {
   try {
     const resp = await fetch("/api/job/start", { method: "POST" });
     if (resp.ok) {
-      $("upload-status").textContent = "Job started.";
-      $("btn-run").disabled = true;
-      setQueuedFile(null);
+      setJobStatus("Job started.");
+      selectedFileStem = null;
       await loadFiles();
     } else {
       const body = await resp.json().catch(() => ({}));
-      $("upload-status").textContent = `Start failed: ${body.detail ?? resp.status}`;
+      setJobStatus(`Start failed: ${body.detail ?? resp.status}`);
     }
   } catch (e) {
-    $("upload-status").textContent = `Start error: ${e.message}`;
+    setJobStatus(`Start error: ${e.message}`);
   }
 }
 
-function setQueuedFile(name) {
-  const el = $("queued-file");
-  el.textContent = name ? `Queued: ${name}` : "";
+function setJobStatus(msg) {
+  const el = $("job-status");
+  if (el) el.textContent = msg;
 }
-
-$("btn-upload").addEventListener("click", uploadFile);
-$("btn-run").addEventListener("click", runUploaded);
 
 // ---------------------------------------------------------------------------
 // Files widget
 // ---------------------------------------------------------------------------
 
 let selectedFileStem = null;
+
+// + button opens the hidden file input; selecting a file auto-uploads
+$("btn-add-file").addEventListener("click", () => $("gcode-file").click());
+$("gcode-file").addEventListener("change", async () => {
+  const file = $("gcode-file").files[0];
+  if (!file) return;
+  const formData = new FormData();
+  formData.append("file", file);
+  // Reset so the same file can be re-selected later
+  $("gcode-file").value = "";
+  try {
+    const resp = await fetch("/api/job", { method: "POST", body: formData });
+    if (resp.ok) {
+      const data = await resp.json();
+      // Stage as "uploaded" — treat it like selecting a file from the list
+      selectedFileStem = "uploaded";
+      setJobFilename(data.filename ?? file.name);
+      updateRunButton();
+      setJobStatus(`Uploaded: ${file.name} (${data.line_count} lines)`);
+      await loadFiles();
+    } else {
+      const body = await resp.json().catch(() => ({}));
+      setJobStatus(`Upload failed: ${body.detail ?? resp.status}`);
+    }
+  } catch (e) {
+    setJobStatus(`Upload error: ${e.message}`);
+  }
+});
+
+function setJobFilename(name) {
+  const el = $("job-filename");
+  if (el) { el.textContent = name ?? "—"; el.title = name ?? ""; }
+}
+
+function updateRunButton() {
+  // Only relevant when not executing/paused — controls are managed by updateJobControls otherwise
+  const btn = $("btn-run");
+  if (btn) btn.disabled = selectedFileStem === null;
+}
 
 function formatBytes(n) {
   if (n == null) return "";
@@ -332,9 +361,9 @@ async function selectFile(stem, displayName) {
     const resp = await fetch(`/api/files/${encodeURIComponent(stem)}/select`, { method: "POST" });
     if (resp.ok) {
       selectedFileStem = stem;
-      setQueuedFile(displayName);
-      $("btn-run").disabled = false;
-      $("upload-status").textContent = "";
+      setJobFilename(displayName);
+      updateRunButton();
+      setJobStatus("");
       await loadFiles();  // re-render to update selected highlight
     } else {
       const body = await resp.json().catch(() => ({}));
@@ -352,8 +381,8 @@ async function deleteFile(stem, displayName) {
     if (resp.ok) {
       if (stem === selectedFileStem) {
         selectedFileStem = null;
-        setQueuedFile(null);
-        $("btn-run").disabled = true;
+        setJobFilename(null);
+        updateRunButton();
       }
       await loadFiles();
     } else {

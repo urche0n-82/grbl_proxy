@@ -49,6 +49,10 @@
       </div>
       <div class="status-grid">
         <div class="status-row">
+          <span class="label">File</span>
+          <span id="job-filename" class="value" style="text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px">—</span>
+        </div>
+        <div class="status-row">
           <span class="label">Lines</span>
           <span id="job-lines" class="value mono">—</span>
         </div>
@@ -57,24 +61,19 @@
           <span id="job-elapsed" class="value mono">—</span>
         </div>
       </div>
-      <div class="button-row">
-        <button id="btn-pause"  class="btn btn-warning">Pause</button>
-        <button id="btn-resume" class="btn btn-success">Resume</button>
-        <button id="btn-cancel" class="btn btn-danger">Cancel</button>
+      <div id="job-controls" class="button-row">
+        <!-- Swapped by JS: Run button -or- Pause/Resume/Cancel -->
+        <button id="btn-run" class="btn btn-success" disabled>Run</button>
       </div>
-      <hr class="card-divider" />
-      <h3>Upload &amp; Run</h3>
-      <div class="upload-row">
-        <input type="file" id="gcode-file" accept=".gcode,.gc,.nc,.txt" />
-        <button id="btn-upload" class="btn btn-primary">Upload</button>
-        <button id="btn-run"    class="btn btn-success" disabled>Run</button>
-      </div>
-      <div id="upload-status" class="upload-status"></div>
-      <div id="queued-file" class="queued-file"></div>
+      <div id="job-status" class="upload-status"></div>
     </section>
 
     <section class="card" id="files-card">
-      <h2>Files</h2>
+      <div class="files-header">
+        <h2>Files</h2>
+        <button id="btn-add-file" class="btn-add" title="Upload file">+</button>
+        <input type="file" id="gcode-file" accept=".gcode,.gc,.nc,.txt" style="display:none" />
+      </div>
       <ul id="files-list" class="files-list">
         <li class="files-empty">No files stored yet.</li>
       </ul>

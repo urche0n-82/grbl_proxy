@@ -184,22 +184,7 @@ main {
 }
 .console-input-row input:focus { border-color: var(--accent); }
 
-/* Upload & Run */
-.card-divider { border: none; border-top: 1px solid var(--border); margin: 16px 0 12px; }
-.card h3 { font-size: 0.8rem; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
-
-.upload-row {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-  flex-wrap: wrap;
-}
-.upload-row input[type="file"] {
-  flex: 1;
-  min-width: 0;
-  color: var(--text);
-  font-size: 0.85em;
-}
+/* Job status line (below controls) */
 .upload-status {
   margin-top: 8px;
   font-size: 0.82em;
@@ -208,6 +193,31 @@ main {
 }
 
 /* Files widget */
+.files-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 14px;
+}
+.files-header h2 { margin-bottom: 0; flex: 1; }
+
+.btn-add {
+  background: none;
+  border: 1px solid var(--border);
+  color: var(--text);
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.12s, color 0.12s;
+  flex-shrink: 0;
+}
+.btn-add:hover { border-color: var(--accent); color: var(--accent); }
+
 .files-list {
   list-style: none;
   display: flex;
@@ -265,16 +275,6 @@ main {
   transition: color 0.12s;
 }
 .btn-trash:hover { color: var(--danger); }
-
-.queued-file {
-  margin-top: 6px;
-  font-size: 0.82em;
-  color: var(--accent);
-  min-height: 1.2em;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
 
 /* Job History */
 #history-card { grid-column: 1 / -1; }
