@@ -2,6 +2,8 @@
 
 const $ = (id) => document.getElementById(id);
 
+let selectedFileStem = null;
+
 // ---------------------------------------------------------------------------
 // WebSocket
 // ---------------------------------------------------------------------------
@@ -87,6 +89,15 @@ function applySnapshot(s) {
   updateJobControls(active, executing, paused);
 }
 
+// Delegated listener on #job-controls — survives innerHTML swaps
+document.getElementById("job-controls").addEventListener("click", (e) => {
+  const id = e.target.id;
+  if (id === "btn-run")    runQueued();
+  if (id === "btn-pause")  jobAction("pause");
+  if (id === "btn-resume") jobAction("resume");
+  if (id === "btn-cancel") jobAction("cancel");
+});
+
 function updateJobControls(active, executing, paused) {
   const row = $("job-controls");
   if (active) {
@@ -98,15 +109,11 @@ function updateJobControls(active, executing, paused) {
     $("btn-pause").disabled  = !executing;
     $("btn-resume").disabled = !paused;
     $("btn-cancel").disabled = false;
-    $("btn-pause").addEventListener("click",  () => jobAction("pause"));
-    $("btn-resume").addEventListener("click", () => jobAction("resume"));
-    $("btn-cancel").addEventListener("click", () => jobAction("cancel"));
   } else {
     // Show Run button; enabled only if a file is queued
     const hasQueued = selectedFileStem !== null;
     row.innerHTML =
       `<button id="btn-run" class="btn btn-success"${hasQueued ? "" : " disabled"}>Run</button>`;
-    $("btn-run").addEventListener("click", runQueued);
   }
 }
 
@@ -219,9 +226,6 @@ async function sendConsole() {
   }
 }
 
-// Initial Run button listener (before any WS snapshot swaps it)
-$("btn-run").addEventListener("click", runQueued);
-
 $("btn-send").addEventListener("click", sendConsole);
 
 // Allow Enter key in console input
@@ -266,8 +270,6 @@ function setJobStatus(msg) {
 // ---------------------------------------------------------------------------
 // Files widget
 // ---------------------------------------------------------------------------
-
-let selectedFileStem = null;
 
 // + button opens the hidden file input; selecting a file auto-uploads
 $("btn-add-file").addEventListener("click", () => $("gcode-file").click());
