@@ -197,8 +197,8 @@ class ProxyControl:
 
         if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED):
             return False, f"Cannot start job in state {core._state.value}"
-        if serial is None:
-            return False, "No serial connection"
+        if serial is None or not serial.is_connected:
+            return False, "Serial port not connected"
 
         storage_dir = _Path(storage_dir).expanduser()
         uploaded = storage_dir / "uploaded.gcode"
