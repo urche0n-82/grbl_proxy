@@ -176,20 +176,7 @@ class JobBuffer:
         self._rotate_history()
 
     def _rotate_history(self) -> None:
-        """Delete oldest .gcode/.meta.json pairs if history exceeds max_history."""
-        meta_files = sorted(self._storage_dir.glob("*.meta.json"))
-        excess = len(meta_files) - self._max_history
-        if excess <= 0:
-            return
-        for meta_file in meta_files[:excess]:
-            stem = meta_file.stem  # e.g. "20250321_143022"
-            gcode_file = self._storage_dir / f"{stem}.gcode"
-            try:
-                meta_file.unlink(missing_ok=True)
-                gcode_file.unlink(missing_ok=True)
-                logger.info("History rotation: deleted %s", stem)
-            except Exception as e:
-                logger.warning("History rotation error for %s: %s", stem, e)
+        rotate_history(self._storage_dir, self._max_history)
 
     async def _flush(self) -> None:
         if not self._pending:
@@ -197,6 +184,23 @@ class JobBuffer:
         data = "".join(self._pending)
         self._pending.clear()
         await asyncio.to_thread(self._flush_sync, data)
+
+
+def rotate_history(storage_dir: Path, max_history: int) -> None:
+    """Delete oldest .gcode/.meta.json pairs if history exceeds max_history."""
+    meta_files = sorted(storage_dir.glob("*.meta.json"))
+    excess = len(meta_files) - max_history
+    if excess <= 0:
+        return
+    for meta_file in meta_files[:excess]:
+        stem = meta_file.stem
+        gcode_file = storage_dir / f"{stem}.gcode"
+        try:
+            meta_file.unlink(missing_ok=True)
+            gcode_file.unlink(missing_ok=True)
+            logger.info("History rotation: deleted %s", stem)
+        except Exception as e:
+            logger.warning("History rotation error for %s: %s", stem, e)
 
 
 def load_job_history(storage_dir: Path, max_history: int = 20) -> list[dict]:

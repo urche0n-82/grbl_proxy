@@ -181,12 +181,15 @@ class ProxyControl:
         return True, "ok"
 
     async def start_uploaded_job(
-        self, storage_dir, original_filename: str | None = None
+        self, storage_dir, original_filename: str | None = None, max_history: int = 20
     ) -> tuple[bool, str]:
         """Start a previously uploaded G-code job. Valid in PASSTHROUGH or DISCONNECTED."""
         from grbl_proxy.proxy_core import ProxyState
-        from grbl_proxy.job_buffer import JobMetadata
+        from grbl_proxy.job_buffer import JobMetadata, rotate_history
         import time as _time
+        import json as _json
+        import re as _re
+        from dataclasses import asdict as _asdict
         from pathlib import Path as _Path
 
         core = self._core
@@ -209,11 +212,32 @@ class ProxyControl:
             return False, f"Cannot read uploaded file: {e}"
 
         start_time = _time.time()
-        from datetime import datetime as _dt
-        timestamp = _dt.fromtimestamp(start_time).strftime("%Y%m%d_%H%M%S")
-        archived_path = storage_dir / f"{timestamp}.gcode"
 
-        # Rename uploaded.gcode to timestamp.gcode so history works
+        # Determine the archive stem: use sanitised original filename for uploads,
+        # fall back to timestamp (for jobs with no known name).
+        def _safe_stem(name: str) -> str:
+            stem = _Path(name).stem.strip()
+            stem = _re.sub(r"[^\w\-]", "_", stem)
+            stem = _re.sub(r"_+", "_", stem).strip("_")
+            return stem or "job"
+
+        def _unique_stem(base: str) -> str:
+            if not (storage_dir / f"{base}.gcode").exists():
+                return base
+            n = 2
+            while (storage_dir / f"{base}_{n}.gcode").exists():
+                n += 1
+            return f"{base}_{n}"
+
+        if original_filename:
+            stem = _unique_stem(_safe_stem(original_filename))
+        else:
+            from datetime import datetime as _dt
+            stem = _dt.fromtimestamp(start_time).strftime("%Y%m%d_%H%M%S")
+
+        archived_path = storage_dir / f"{stem}.gcode"
+
+        # Rename uploaded.gcode to its permanent name
         try:
             uploaded.rename(archived_path)
         except Exception as e:
@@ -228,6 +252,16 @@ class ProxyControl:
             source="upload",
             original_filename=original_filename,
         )
+
+        # Write meta.json immediately so the Files widget can display the name
+        try:
+            meta_path = storage_dir / f"{stem}.meta.json"
+            data = _asdict(meta)
+            data["path"] = str(archived_path)
+            meta_path.write_text(_json.dumps(data, indent=2), encoding="utf-8")
+            rotate_history(storage_dir, max_history)
+        except Exception as e:
+            logger.warning("Could not write meta.json for upload job: %s", e)
 
         # Wire serial_conn into core so _start_streamer can use it
         if core._serial_conn is None:

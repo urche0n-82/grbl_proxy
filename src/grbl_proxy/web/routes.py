@@ -149,7 +149,9 @@ def create_router() -> APIRouter:
             except Exception:
                 pass
         ok, reason = await _control(request).start_uploaded_job(
-            storage_dir, original_filename=original_filename
+            storage_dir,
+            original_filename=original_filename,
+            max_history=cfg.job.max_history,
         )
         if not ok:
             raise HTTPException(status_code=409, detail=reason)
