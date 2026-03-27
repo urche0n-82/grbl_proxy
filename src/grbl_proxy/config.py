@@ -61,12 +61,19 @@ class MachineConfig:
 
 
 @dataclass
+class WebcamConfig:
+    enabled: bool = False
+    stream_url: str = ""   # e.g. "http://raspberrypi.local:8081/?action=stream"
+
+
+@dataclass
 class Config:
     serial: SerialConfig = field(default_factory=SerialConfig)
     tcp: TcpConfig = field(default_factory=TcpConfig)
     web: WebConfig = field(default_factory=WebConfig)
     job: JobConfig = field(default_factory=JobConfig)
     machine: MachineConfig = field(default_factory=MachineConfig)
+    webcam: WebcamConfig = field(default_factory=WebcamConfig)
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
@@ -86,6 +93,7 @@ def _dict_to_config(data: dict) -> Config:
     web_data = data.get("web", {})
     job_data = data.get("job", {})
     machine_data = data.get("machine", {})
+    webcam_data = data.get("webcam", {})
 
     auto_detect_data = job_data.pop("auto_detect", {})
     auto_detect = AutoDetectConfig(**{k: v for k, v in auto_detect_data.items()
@@ -105,6 +113,8 @@ def _dict_to_config(data: dict) -> Config:
         ),
         machine=MachineConfig(**{k: v for k, v in machine_data.items()
                                  if k in MachineConfig.__dataclass_fields__}),
+        webcam=WebcamConfig(**{k: v for k, v in webcam_data.items()
+                               if k in WebcamConfig.__dataclass_fields__}),
     )
 
 

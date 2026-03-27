@@ -331,6 +331,14 @@ def create_router() -> APIRouter:
         display_name = await asyncio.to_thread(_select)
         return {"ok": True, "display_name": display_name}
 
+    @router.get("/api/webcam")
+    async def get_webcam_config(request: Request):
+        cfg = _config(request)
+        return {
+            "enabled": cfg.webcam.enabled,
+            "stream_url": cfg.webcam.stream_url,
+        }
+
     @router.get("/api/settings")
     async def get_settings(request: Request):
         cfg = _config(request)

@@ -455,6 +455,42 @@ async function loadHistory() {
 }
 
 // ---------------------------------------------------------------------------
+// Webcam
+// ---------------------------------------------------------------------------
+
+let webcamStreamUrl = "";
+
+async function loadWebcam() {
+  try {
+    const resp = await fetch("/api/webcam");
+    const cfg = await resp.json();
+    if (!cfg.enabled || !cfg.stream_url) return;
+    webcamStreamUrl = cfg.stream_url;
+    const card = $("webcam-card");
+    card.style.display = "";
+    const collapsed = localStorage.getItem("webcamCollapsed") === "true";
+    setWebcamCollapsed(collapsed);
+  } catch (e) {
+    console.warn("webcam config error", e);
+  }
+}
+
+function setWebcamCollapsed(collapsed) {
+  const body = $("webcam-body");
+  const btn  = $("btn-webcam-toggle");
+  const img  = $("webcam-img");
+  body.classList.toggle("collapsed", collapsed);
+  btn.textContent = collapsed ? "▼" : "▲";
+  img.src = collapsed ? "" : webcamStreamUrl;
+  localStorage.setItem("webcamCollapsed", collapsed);
+}
+
+$("btn-webcam-toggle").addEventListener("click", () => {
+  const collapsed = !$("webcam-body").classList.contains("collapsed");
+  setWebcamCollapsed(collapsed);
+});
+
+// ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
 
@@ -462,6 +498,7 @@ connectWS();
 loadConsole();
 loadHistory();
 loadFiles();
+loadWebcam();
 
 // Poll for new console entries and append only the new ones
 setInterval(pollConsole, 1000);
