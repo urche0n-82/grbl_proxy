@@ -19,7 +19,7 @@ job:
   storage_dir: ~/.grbl-proxy/jobs
   max_history: 20
   start_marker: "G4 P0.0"   # put this in LightBurn's Start G-code device profile field
-  end_marker: "G4 P0.0"     # put this in LightBurn's End G-code device profile field
+  end_marker: ""             # leave blank — LightBurn sends M30 to end the job
   auto_detect:
     enabled: false    # disabled: framing/jogging bursts trigger false positives
 

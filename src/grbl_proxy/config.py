@@ -49,7 +49,7 @@ class JobConfig:
     storage_dir: str = "~/.grbl-proxy/jobs"
     max_history: int = 20
     start_marker: str = "G4 P0.0"
-    end_marker: str = "G4 P0.0"
+    end_marker: str = ""
     auto_detect: AutoDetectConfig = field(default_factory=AutoDetectConfig)
 
 

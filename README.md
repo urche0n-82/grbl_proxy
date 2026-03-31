@@ -1,35 +1,38 @@
 # GRBL Proxy
 
-> **Early development.** This project is a work in progress. APIs and configuration may change.
->
-> **WARNING: This software controls laser cutting hardware. Use at your own risk.** The authors accept no liability for damage to equipment, materials, or injury caused by use of this software. Never leave a laser running unattended. Always power the laser off when not in use.
+> **WARNING: This software controls laser cutting hardware. Use at your own risk.** The authors accept no liability for damage to equipment, materials, or injury caused by use of this software. Never leave a laser running unattended. Always power off the laser when not in use.
 
-A Raspberry Pi-based proxy that sits between [LightBurn](https://lightburnsoftware.com/) and a GRBL laser cutter (tested on the Creality Falcon 2 Pro), enabling disconnect-safe job execution and remote monitoring.
+A Raspberry Pi proxy that sits between [LightBurn](https://lightburnsoftware.com/) and a GRBL laser cutter (tested on the Creality Falcon 2 Pro / ESP32-S2).
 
-**LightBurn connects to the proxy exactly as it would to a direct GRBL device** — no plugins, no export workflow. Hit Start in LightBurn and walk away. If your laptop sleeps or WiFi drops, the job keeps running.
+**LightBurn connects to the proxy exactly as it would connect to the laser directly** — no plugins, no export workflow. Hit Start in LightBurn as normal. Once the job is buffered, it runs to completion on the Pi even if your laptop sleeps, WiFi drops, or LightBurn is closed.
 
 ## Features
 
 - **Transparent passthrough** — jogging, homing, framing, and console commands all work normally when idle
-- **Disconnect-safe jobs** — once a job is buffered, it executes to completion regardless of the LightBurn connection
-- **Web dashboard** — real-time position, job progress, pause/resume/cancel, and console panel accessible from any browser on the network
+- **Disconnect-safe jobs** — once a job is buffered to disk it runs to completion, independent of the LightBurn connection
+- **Web dashboard** — real-time machine position, job progress, pause/resume/cancel, file manager, and console from any browser on the network
 - **Standalone operation** — upload G-code files directly from the dashboard and run them without LightBurn connected
-- **Job history** — completed jobs are archived as timestamped files; the dashboard lists past runs with duration, line count, and a download link
+- **File manager** — browse, select, and delete stored G-code files from the dashboard; uploaded files keep their original filename
+- **Job history** — completed jobs are archived with metadata; the dashboard lists past runs with duration, line count, and a download link
+- **Webcam feed** — optional live MJPEG webcam stream embedded in the dashboard (requires `mjpg-streamer` on the Pi)
 - **Idle GRBL polling** — machine state and position are visible in the dashboard even when LightBurn is not connected
-- **REST API** — machine state, job control, G-code upload, and history over HTTP
-- **Auto-reconnect** — if the USB cable to the laser drops, the proxy reconnects automatically
-- **Single TCP client** — if LightBurn reconnects, the old socket is cleanly replaced
+- **Auto-reconnect** — if the USB cable to the laser is unplugged, the proxy reconnects automatically
+- **REST API** — full machine control and status over HTTP; interactive docs at `/api/docs`
 
 ## Requirements
 
 - Raspberry Pi (3B+, 4, 5, or Zero 2 W) running Raspberry Pi OS
 - Python 3.11 or later
-- USB connection to a GRBL 1.1 laser controller (e.g. Creality Falcon 2 Pro / ESP32-S2)
+- USB connection to a GRBL 1.1 laser controller
 - LightBurn on any machine on the same network
+
+---
 
 ## Installation
 
 ### 1. Clone the repository
+
+On the Raspberry Pi:
 
 ```bash
 git clone https://github.com/urche0n-82/grbl_proxy.git ~/grbl-proxy
@@ -42,153 +45,213 @@ cd ~/grbl-proxy
 bash install.sh
 ```
 
-The installer handles everything: system packages, Python virtual environment, config file, port 23 capability grant, and systemd service registration. It is safe to re-run — steps that are already complete are skipped.
+The installer handles everything in one step:
 
-After it finishes, review your config if needed:
+- Installs required system packages (`python3-venv`, `libcap2-bin`)
+- Adds your user to the `dialout` group for serial port access
+- Creates a Python virtual environment and installs grbl-proxy into it
+- Copies `config.yaml.example` to `~/.grbl-proxy/config.yaml`
+- Grants the venv Python the `cap_net_bind_service` capability so it can listen on port 23
+- Installs and enables the `grbl-proxy` systemd service
+
+It is safe to re-run — steps that are already done are skipped.
+
+### 3. Review configuration
 
 ```bash
 nano ~/.grbl-proxy/config.yaml
 ```
 
-The only fields you are likely to need to change are `serial.port` (if auto-detection picks the wrong device) and the LightBurn job markers:
+The defaults work for most setups. The fields you are most likely to need to change:
 
 ```yaml
 serial:
-  port: auto        # or /dev/ttyUSB0, /dev/ttyACM0, etc.
+  port: auto        # or set explicitly: /dev/ttyUSB0, /dev/ttyACM0, etc.
 
-job:
-  start_marker: "G4 P0.0"   # matches LightBurn's Start G-code field
-  end_marker:   ""   # default to M2/M30 end of file code. no custom code needed.
+machine:
+  name: "Falcon 2 Pro"
+  work_area: [400, 415]   # width x height in mm — match your machine
 ```
 
-If the installer added you to the `dialout` group, **log out and back in** before starting the service.
+### 4. Log out and back in (if prompted)
 
-## Running
+If the installer added you to the `dialout` group, you must log out and back in before the group membership takes effect. The systemd service is already configured correctly — this step only matters if you plan to run the proxy manually as your user.
 
-### As a systemd service (auto-start on boot)
+### 5. Start the service
 
 ```bash
 sudo systemctl start grbl-proxy
 ```
 
-Check status and logs:
+Check that it started cleanly:
 
 ```bash
 sudo systemctl status grbl-proxy
 journalctl -u grbl-proxy -f
 ```
 
-### Manually (for testing)
+The service is enabled to start automatically on boot.
+
+---
+
+## LightBurn setup
+
+### Add the device
+
+1. Open LightBurn → **Laser** panel → **Devices**
+2. Click **Create Manually**
+3. Device type: **GRBL**
+4. Connection: **Ethernet/TCP**
+5. IP address: your Pi's IP address (e.g. `10.0.8.141`)
+6. Port: `23`
+7. Work area: match your machine (e.g. `400 × 415 mm` for the Falcon 2 Pro)
+8. Click **Finish**, then select the new device
+
+> **Finding your Pi's IP address:** run `hostname -I` on the Pi, or check your router's DHCP table. A static IP is recommended so the address never changes — set this in your router or in `/etc/dhcpcd.conf` on the Pi.
+
+### Configure the job buffer start marker
+
+The proxy uses a G-code marker sent at the start of a job to know when to begin buffering. Configure it in LightBurn under **Edit → Device Settings → Additional Settings**:
+
+- **Start G-code:** `G4 P0.0`
+- **End G-code:** *(leave blank)*
+
+`G4 P0.0` is a zero-duration dwell — it is harmless to GRBL and does not move the laser. The End G-code field can be left blank because LightBurn automatically sends `M30` at the end of every job, which the proxy uses as the end-of-job signal.
+
+> Without the Start G-code marker, the proxy will not know when a job begins and will pass all G-code straight through to the laser without buffering. The job will run, but it will not be disconnect-safe.
+
+### Verify the connection
+
+Click **Connect** in LightBurn. The status bar should show the device as connected. Send `$I` from the LightBurn console — you should see GRBL's version string in the response.
+
+---
+
+## Web dashboard
+
+Open a browser on any device on the same network:
+
+```
+http://<pi-ip>:8080
+```
+
+The dashboard provides:
+
+| Widget | What it shows / does |
+|---|---|
+| **Machine Status** | Proxy state, GRBL state (Idle / Run / Hold / Alarm), serial connection badge, X/Y/Z position, feed rate, spindle power. Home and Cancel Alarm buttons. |
+| **Job** | Active job progress bar, lines sent / total, elapsed time. Run, Pause / Resume, and Cancel buttons. Shows the selected file name. |
+| **Files** | Lists all stored G-code files. Click a file to select it for the next run. `+` button to upload a new file. Trash icon to delete. Uploaded files retain their original filename. |
+| **Webcam** | Live MJPEG feed from a USB webcam (if configured). Collapsible; pauses the stream when collapsed to save bandwidth. |
+| **Console** | Scrolling log of recent serial I/O. Command input field to send GRBL commands directly. Toggle to hide `?` status-report noise. |
+| **Job History** | Table of completed jobs: date, source (LightBurn or upload), line count, duration, and a download link for the G-code file. |
+
+The dashboard updates in real time via WebSocket — 4 times per second during a job, once per second when idle.
+
+---
+
+## Configuration reference
+
+The full config file with all defaults:
+
+```yaml
+# ~/.grbl-proxy/config.yaml
+
+serial:
+  port: auto                  # auto-detect, or explicit path e.g. /dev/ttyACM0
+  baud: 115200
+  dtr: false                  # CRITICAL: must be false for ESP32-S2 controllers
+  reconnect_interval: 5       # seconds between reconnect attempts
+
+tcp:
+  host: 0.0.0.0
+  port: 23                    # LightBurn requires port 23 for GRBL Ethernet devices
+
+web:
+  host: 0.0.0.0
+  port: 8080
+
+job:
+  storage_dir: ~/.grbl-proxy/jobs
+  max_history: 20             # oldest files are deleted when this limit is exceeded
+  start_marker: "G4 P0.0"    # must match LightBurn's Start G-code field
+  end_marker: ""              # leave blank — LightBurn sends M30 to end the job
+
+machine:
+  name: "GRBL Machine"
+  work_area: [400, 415]       # mm [width, height]
+  status_poll_hz: 4           # how often to poll GRBL when LightBurn is not connected
+
+webcam:
+  enabled: false
+  stream_url: ""              # e.g. "http://10.0.8.141:8081/?action=stream"
+```
+
+Only include the fields you want to change — everything else falls back to the defaults shown above.
+
+---
+
+## Webcam setup (optional)
+
+The dashboard can display a live feed from a USB webcam connected to the Pi. The proxy does not capture video itself — it uses [`mjpg-streamer`](https://github.com/jacksonliam/mjpg-streamer) as a separate process to serve the camera as an MJPEG HTTP stream.
+
+### Install mjpg-streamer
 
 ```bash
+sudo apt install mjpg-streamer
+```
+
+If it is not available via apt, build from source:
+
+```bash
+sudo apt install cmake libjpeg9-dev
+git clone https://github.com/jacksonliam/mjpg-streamer.git
+cd mjpg-streamer/mjpg-streamer-experimental
+make
+sudo make install
+```
+
+### Run mjpg-streamer
+
+```bash
+mjpg_streamer \
+  -i "input_uvc.so -d /dev/video0 -r 640x480 -f 15" \
+  -o "output_http.so -p 8081 -w /usr/share/mjpg-streamer/www"
+```
+
+The stream is then available at `http://<pi-ip>:8081/?action=stream`. You can open this URL directly in any browser to verify the camera is working before wiring it into the dashboard.
+
+To start mjpg-streamer automatically on boot, create a systemd service or add it to `/etc/rc.local`.
+
+### Enable the webcam widget
+
+Add to `~/.grbl-proxy/config.yaml`:
+
+```yaml
+webcam:
+  enabled: true
+  stream_url: "http://10.0.8.141:8081/?action=stream"
+```
+
+Restart grbl-proxy (`sudo systemctl restart grbl-proxy`). The Webcam card will appear in the dashboard. The stream only loads when the widget is expanded — collapsing it disconnects the stream to save bandwidth. The collapsed/expanded state is remembered between page loads.
+
+The same `stream_url` can be opened directly in a browser, VLC, or OBS on your Mac.
+
+---
+
+## Running manually (for testing)
+
+```bash
+cd ~/grbl-proxy
 .venv/bin/grbl-proxy --debug
 ```
 
-Type `?` into a netcat session to verify the GRBL connection:
+Verify the GRBL connection with netcat:
 
 ```bash
 nc <pi-ip> 23
 ```
 
-You should get a GRBL status response like `<Idle|MPos:0.000,0.000,0.000|FS:0,0>`.
-
-Open the web dashboard at:
-
-```
-http://<pi-ip>:8080
-```
-
-## LightBurn device setup
-
-1. Open LightBurn → **Devices** → **Create Manually**
-2. Select **GRBL**
-3. Connection type: **Ethernet/TCP**
-4. IP address: your Pi's static IP on the local network
-5. Port: `23`
-6. Work area: `400 × 415 mm` (adjust for your machine)
-7. Click **Finish**
-
-To enable disconnect-safe job buffering (Phase 2+), add these under **Edit → Device Settings → Additional Settings**:
-
-- **Start G-code**: `G4 P0.0`
-- **End G-code**: `G4 P0.0`
-
-The proxy uses this dwell command as a job boundary marker. It is harmless to GRBL and does not move the laser.
-
-## Web dashboard
-
-Once the proxy is running, open a browser on any device on the same network:
-
-```
-http://<pi-ip>:8080
-```
-
-The dashboard shows:
-
-- **Machine status** — proxy state, GRBL state (Idle / Run / Hold / Alarm), serial connection badge, current position (X, Y, Z), feed rate and spindle power
-- **Job progress** — progress bar, lines sent / total, elapsed time
-- **Controls** — Pause, Resume, and Cancel buttons (active only when applicable)
-- **Upload & Run** — file picker to upload a `.gcode` file and run it directly from the browser (no LightBurn required)
-- **Console** — scrolling log of recent serial I/O with a command input field and a toggle to hide status-report noise
-- **Job history** — table of completed jobs with date, source (LightBurn or upload), line count, duration, and a download link for the G-code file
-
-The REST API is available at `/api/` and is documented interactively at `http://<pi-ip>:8080/api/docs`.
-
-### Web configuration
-
-```yaml
-# ~/.grbl-proxy/config.yaml
-web:
-  host: 0.0.0.0   # bind address — 0.0.0.0 listens on all interfaces
-  port: 8080       # change if 8080 conflicts with something else on the Pi
-
-machine:
-  status_poll_hz: 4   # how often (Hz) to send ? to GRBL when LightBurn is not connected
-
-job:
-  storage_dir: ~/.grbl-proxy/jobs   # where completed job files are archived
-  max_history: 20                   # number of completed jobs to keep; oldest deleted when exceeded
-```
-
-### REST API reference
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/status` | GET | Full machine and proxy state snapshot (includes `serial_connected`) |
-| `/api/job` | GET | Job progress (lines sent, total, percentage, elapsed time) |
-| `/api/job` | POST | Upload a G-code file (multipart form, field `file`) |
-| `/api/job/start` | POST | Start the uploaded file — valid in Passthrough or Disconnected state |
-| `/api/job/pause` | POST | Send feed hold — valid in Executing state |
-| `/api/job/resume` | POST | Send cycle resume — valid in Paused state |
-| `/api/job/cancel` | POST | Soft reset + cancel — valid in Executing or Paused state |
-| `/api/jobs` | GET | List of completed job metadata, newest first (capped at `max_history`) |
-| `/api/jobs/{timestamp}/download` | GET | Download a completed job's G-code file |
-| `/api/console` | GET | Recent serial console log (`?n=50` to control count) |
-| `/api/console` | POST | Send a GRBL command (`{"command": "$$"}`) — valid in Passthrough state |
-| `/api/settings` | GET | Current proxy configuration |
-| `/ws/status` | WebSocket | Real-time status push — 4 Hz during execution, 1 Hz at idle |
-
-Control endpoints return HTTP 409 with a description if the command is not valid in the current state.
-
-## Development
-
-### Install with dev dependencies
-
-```bash
-pip install -e ".[dev]"
-```
-
-### Run tests
-
-```bash
-pytest
-```
-
-All tests run without hardware using an in-process GRBL mock — no serial port required.
-
-```
-148 passed
-```
+Type `?` and press Enter — you should get a GRBL status response like `<Idle|MPos:0.000,0.000,0.000|FS:0,0>`.
 
 ### CLI options
 
@@ -197,115 +260,108 @@ grbl-proxy --help
 
 usage: grbl-proxy [-h] [--config CONFIG] [--debug]
 
-GRBL Laser Proxy
-
 options:
   -h, --help            show this help message and exit
-  --config, -c CONFIG   Path to config.yaml (default: ~/.grbl-proxy/config.yaml)
-  --debug, -d           Enable debug logging
+  --config, -c CONFIG   path to config.yaml (default: ~/.grbl-proxy/config.yaml)
+  --debug, -d           enable debug logging
 ```
+
+---
+
+## REST API
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/status` | GET | Full machine and proxy state snapshot |
+| `/api/job` | GET | Job progress (lines sent, total, percentage, elapsed time) |
+| `/api/job` | POST | Upload a G-code file (multipart form, field `file`) |
+| `/api/job/start` | POST | Start the uploaded file — valid in Passthrough or Disconnected state |
+| `/api/job/pause` | POST | Send feed hold — valid in Executing state |
+| `/api/job/resume` | POST | Send cycle resume — valid in Paused state |
+| `/api/job/cancel` | POST | Soft reset + cancel — valid in Executing or Paused state |
+| `/api/files` | GET | List all stored G-code files with name, size, and line count |
+| `/api/files/{stem}/select` | POST | Stage an existing file as the next job to run |
+| `/api/files/{stem}` | DELETE | Delete a stored G-code file |
+| `/api/jobs` | GET | Completed job history, newest first |
+| `/api/jobs/{stem}/download` | GET | Download a completed job's G-code file |
+| `/api/console` | GET | Recent serial console log (`?n=50` to control count) |
+| `/api/console` | POST | Send a GRBL command (`{"command": "$I"}`) |
+| `/api/webcam` | GET | Webcam config (`{enabled, stream_url}`) |
+| `/api/settings` | GET | Full proxy configuration |
+| `/ws/status` | WebSocket | Real-time status push — 4 Hz during execution, 1 Hz at idle |
+
+Control endpoints return HTTP 409 with a reason string if the command is not valid in the current state.
+
+Interactive API docs: `http://<pi-ip>:8080/api/docs`
+
+---
+
+## Troubleshooting
+
+**Serial port not found**
+Run `ls /dev/ttyUSB* /dev/ttyACM*` with the laser connected. Set the result explicitly in `serial.port` in the config.
+
+**Permission denied on serial port**
+Ensure your user is in the `dialout` group: `sudo usermod -aG dialout $USER`, then log out and back in. The installer does this automatically.
+
+**Laser resets every time the proxy starts or reconnects**
+This is DTR/RTS being asserted on the serial port, which triggers the ESP32-S2 bootloader. Ensure `serial.dtr: false` is set in your config. The installer-generated config already has this set correctly.
+
+**LightBurn shows "disconnected" immediately**
+Check the proxy is running: `sudo systemctl status grbl-proxy`. Check it is listening on port 23: `sudo ss -tlnp | grep 23`. Verify the Pi's IP and port in the LightBurn device settings.
+
+**Job starts in LightBurn but the proxy doesn't buffer it**
+The Start G-code marker is missing or wrong. In LightBurn under **Edit → Device Settings → Additional Settings**, set **Start G-code** to exactly `G4 P0.0` — this must match `job.start_marker` in your config.
+
+**Web dashboard not reachable**
+Confirm the service is running: `journalctl -u grbl-proxy -f`. Check that port 8080 is not blocked: `sudo ufw status`. The web port is configurable via `web.port` in `config.yaml`.
+
+**Proxy stays in Executing state after a job finishes**
+Check `journalctl -u grbl-proxy` for GRBL error or alarm messages. The proxy will stay in Executing state if GRBL returns an error during the job — use the **Cancel Alarm** button in the dashboard (or send `$X` from the console) to clear the alarm and return to idle.
+
+**Reconnect loop filling logs**
+Reconnect polling at the `INFO` level only appears when the proxy is actively attempting to open the port. The "waiting for port to appear" messages are at `DEBUG` level and only visible with `--debug`.
+
+---
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+```
+
+All tests run without hardware using an in-process GRBL mock — no serial port or laser required.
+
+---
 
 ## Project structure
 
 ```
 grbl-proxy/
 ├── src/grbl_proxy/
-│   ├── main.py              # Entry point, CLI, wiring
+│   ├── main.py              # entry point, CLI, wiring
 │   ├── config.py            # YAML config loading
-│   ├── serial_conn.py       # Serial port management + auto-reconnect
+│   ├── serial_conn.py       # serial port management + auto-reconnect
 │   ├── grbl_protocol.py     # GRBL 1.1 message parser
 │   ├── tcp_server.py        # TCP server + bidirectional relay
-│   ├── proxy_core.py        # State machine: Passthrough/Buffering/Executing/Paused/Error
-│   ├── job_buffer.py        # Disk-based G-code buffer
-│   ├── streamer.py          # Character-counting GRBL streamer
+│   ├── proxy_core.py        # state machine: Passthrough/Buffering/Executing/Paused/Error
+│   ├── job_buffer.py        # disk-based G-code buffer + job history
+│   ├── streamer.py          # character-counting GRBL streamer
 │   └── web/
 │       ├── app.py           # FastAPI application factory
 │       ├── routes.py        # REST endpoints + WebSocket push
 │       ├── status.py        # ProxyStatus / ProxyControl facades
-│       ├── console_log.py   # Serial I/O ring buffer
-│       └── static/          # Dashboard HTML/JS/CSS
+│       ├── console_log.py   # serial I/O ring buffer
+│       └── static/          # dashboard HTML/JS/CSS
 ├── tests/
-│   ├── mock_grbl.py         # In-process GRBL mock for testing
-│   ├── test_phase1.py       # Passthrough relay tests
-│   ├── test_phase2.py       # Job detection and buffering tests
-│   ├── test_phase3.py       # Streamer and execution tests
-│   ├── test_phase4.py       # Web API tests
-│   └── test_phase5.py       # Job history, idle poll, upload+run tests
 ├── systemd/
 │   └── grbl-proxy.service
-└── config.yaml.example
+├── config.yaml.example
+└── install.sh
 ```
 
-## Troubleshooting
-
-**Serial port not found**
-Run `ls /dev/ttyUSB* /dev/ttyACM*` with the laser connected. Set the result explicitly in `serial.port`.
-
-**Permission denied on serial port**
-Ensure your user is in the `dialout` group: `sudo usermod -aG dialout $USER` then log out/in.
-
-**LightBurn shows "disconnected" immediately**
-Check that the proxy is running and listening: `sudo ss -tlnp | grep 8899`. Verify the Pi's IP and port in the LightBurn device settings.
-
-**Web dashboard not reachable**
-Confirm the proxy started successfully: `journalctl -u grbl-proxy -f`. Check that port 8080 is not blocked by a firewall on the Pi (`sudo ufw status`). The web port is configurable via `web.port` in `config.yaml`.
-
-**Laser resets every time the proxy starts**
-This means DTR is not being disabled. Ensure `serial.dtr: false` is set in your config — this is critical for ESP32-S2 based controllers.
-
-**Proxy loses connection to laser mid-job**
-The reconnect loop will restore the connection automatically within `serial.reconnect_interval` seconds (default 5s). Check `journalctl -u grbl-proxy -f` for reconnect events.
-
-## Roadmap
-
-### Phase 1 ✅ — Transparent passthrough relay
-
-All LightBurn commands pass through to GRBL unmodified and all GRBL responses flow back. Jogging, homing, framing, laser framing, and console commands work exactly as if LightBurn were connected directly. Serial reconnect runs in the background — if the USB cable drops, the proxy reconnects automatically and LightBurn never notices. A single TCP client is enforced: if LightBurn reconnects, the previous socket is cleanly replaced.
-
-### Phase 2 ✅ — Job detection and disk buffering
-
-When LightBurn starts a job, the proxy intercepts the G-code stream and writes it to a file on disk before any line reaches the laser. Job boundaries are identified by a configurable start marker (default `G4 P0.0`) sent from LightBurn's device start G-code, and an end marker or terminal G-code command (`M2`/`M30`). While buffering, every LightBurn line gets a synthetic `ok` reply so LightBurn's internal send queue drains normally. Status queries (`?`) return a synthetic `<Run|...>` response so LightBurn displays a running job. If LightBurn disconnects mid-buffer, the incomplete file is discarded. An idle timeout finalises the buffer if the end marker never arrives.
-
-**LightBurn device setup for Phase 2:**
-Add these to the device's G-code start/end sequence under **Edit → Device Settings → Additional Settings**:
-- **Start G-code**: `G4 P0.0`
-- **End G-code**: `G4 P0.0`
-
-### Phase 3 ✅ — Character-counting GRBL streamer (disconnect-safe execution)
-
-Once a job is fully buffered, the proxy takes ownership of the serial port and streams the G-code file directly to GRBL using the character-counting flow-control protocol (GRBL's 128-byte RX buffer). LightBurn plays no further role in execution — the job runs to completion whether or not LightBurn stays connected.
-
-**Behaviour during execution:**
-- LightBurn can disconnect and reconnect freely — the job is unaffected.
-- Status queries (`?`) return a synthetic `<Run|...>` response derived from the last known machine position.
-- Interactive commands (`$$`, jog moves, etc.) are rejected with `error:9` (busy).
-- Feed hold (`!`) pauses the streamer; cycle resume (`~`) continues it. Both are forwarded to GRBL.
-- Soft reset (`Ctrl-X`) cancels the job and transitions to Error state.
-- On a GRBL `error:N` or `ALARM:N` response, execution stops and the proxy enters Error state.
-- In Error state all commands are rejected with `error:9` until the operator sends `$X` (alarm clear) or `$H` (re-home), which forwards the command to GRBL and returns the proxy to Passthrough.
-- On successful completion the proxy returns silently to Passthrough, ready for the next job.
-
-### Phase 4 ✅ — Web dashboard
-
-A lightweight browser UI served from the Pi on port 8080 (configurable). See [Web dashboard](#web-dashboard) above for full details.
-
-- Live machine state, position, feed rate, and job progress
-- Pause, resume, and cancel controls that work independently of LightBurn
-- REST API and interactive API docs at `/api/docs`
-- Recent serial console log with command input and status-response filter
-
-### Phase 5 ✅ — Standalone operation and job history
-
-- **Idle GRBL polling** — the proxy sends `?` to GRBL at configurable rate when no LightBurn client is connected; machine state and position are visible in the dashboard at all times
-- **Serial connection badge** — the dashboard shows a separate connected/disconnected indicator for the serial link to the laser, independent of the LightBurn proxy state
-- **Upload & Run** — upload a `.gcode` file directly from the browser and run it without LightBurn; the file is archived in job history on completion like any other job
-- **Job history** — every completed job (from LightBurn or direct upload) is saved as a timestamped `.gcode` + `.meta.json` pair; the dashboard lists past runs with source, line count, duration, and a download link; history is capped at `job.max_history` (default 20) with automatic rotation
-
-### Phase 6 — _(planned)_
-
-- Alarm recovery workflow: guided `$X` / `$H` from the dashboard after a fault
-- Webcam integration: optional MJPEG stream from a USB webcam embedded in the dashboard
-- Proxy configuration UI: edit `config.yaml` settings from the browser
+---
 
 ## License
 
