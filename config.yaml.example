@@ -9,7 +9,7 @@ serial:
 
 tcp:
   host: 0.0.0.0
-  port: 23              # lightburn doesn't seem to allow to change the port 23 is required
+  port: 23              # lightburn defaults to port 23.
 
 web:
   host: 0.0.0.0

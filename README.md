@@ -12,7 +12,7 @@ A Raspberry Pi proxy that sits between [LightBurn](https://lightburnsoftware.com
 - **Disconnect-safe jobs** — once a job is buffered to disk it runs to completion, independent of the LightBurn connection
 - **Web dashboard** — real-time machine position, job progress, pause/resume/cancel, file manager, and console from any browser on the network
 - **Standalone operation** — upload G-code files directly from the dashboard and run them without LightBurn connected
-- **File manager** — browse, select, and delete stored G-code files from the dashboard; uploaded files keep their original filename
+- **File manager** — browse, select, and delete stored G-code files from the dashboard
 - **Job history** — completed jobs are archived with metadata; the dashboard lists past runs with duration, line count, and a download link
 - **Webcam feed** — optional live MJPEG webcam stream embedded in the dashboard (requires `mjpg-streamer` on the Pi)
 - **Idle GRBL polling** — machine state and position are visible in the dashboard even when LightBurn is not connected
@@ -102,23 +102,25 @@ The service is enabled to start automatically on boot.
 2. Click **Create Manually**
 3. Device type: **GRBL**
 4. Connection: **Ethernet/TCP**
-5. IP address: your Pi's IP address (e.g. `10.0.8.141`)
-6. Port: `23`
+5. IP address: your Pi's IP address (e.g. `192.168.1.123`)
+
 7. Work area: match your machine (e.g. `400 × 415 mm` for the Falcon 2 Pro)
 8. Click **Finish**, then select the new device
 
 > **Finding your Pi's IP address:** run `hostname -I` on the Pi, or check your router's DHCP table. A static IP is recommended so the address never changes — set this in your router or in `/etc/dhcpcd.conf` on the Pi.
 
+> **Changing the Port:** Lightburn defaults to Port 23 during the device setup wizard. Once the device is set up, you can change the port in **Laser Tools -> Device Settings -> Basic Settings** and look for the **Network Port** setting.
+
 ### Configure the job buffer start marker
 
-The proxy uses a G-code marker sent at the start of a job to know when to begin buffering. Configure it in LightBurn under **Edit → Device Settings → Additional Settings**:
+The proxy uses a G-code marker sent at the start of a job to know when to begin buffering. Configure it in LightBurn under **Laser Tools → Device Settings → Gcode**:
 
 - **Start G-code:** `G4 P0.0`
 - **End G-code:** *(leave blank)*
 
-`G4 P0.0` is a zero-duration dwell — it is harmless to GRBL and does not move the laser. The End G-code field can be left blank because LightBurn automatically sends `M30` at the end of every job, which the proxy uses as the end-of-job signal.
+`G4 P0.0` is a zero-duration dwell — it is harmless to GRBL and does not move the laser, but it tells grbl-proxy to start buffering the job. The End G-code field can be left blank because LightBurn automatically sends `M30` at the end of every job, which the proxy uses as the end-of-job signal.  If you have a need to signal end-gcode with some other command, it can be set here.
 
-> Without the Start G-code marker, the proxy will not know when a job begins and will pass all G-code straight through to the laser without buffering. The job will run, but it will not be disconnect-safe.
+> Without the Start G-code marker, the proxy will not know when a job begins and will pass all G-code straight through to the laser without buffering. The job will run normally, but it will not be disconnect-safe.
 
 ### Verify the connection
 
@@ -164,7 +166,7 @@ serial:
 
 tcp:
   host: 0.0.0.0
-  port: 23                    # LightBurn requires port 23 for GRBL Ethernet devices
+  port: 23                    # LightBurn defaults to port 23 for GRBL Ethernet devices
 
 web:
   host: 0.0.0.0
