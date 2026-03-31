@@ -202,18 +202,10 @@ class TcpServer:
                     break
 
                 if not self._serial.is_connected:
-                    # Serial unavailable — respond to each incoming line with
-                    # error:9 so LightBurn stops sending and shows alarm state.
-                    writer = self._current_writer
-                    if writer is not None:
-                        lines = data.count(b'\n')
-                        if lines:
-                            try:
-                                writer.write(b"error:9\n" * lines)
-                                await writer.drain()
-                            except (BrokenPipeError, ConnectionResetError):
-                                break
-                    continue
+                    # Serial not available — drop the TCP connection so LightBurn
+                    # shows "disconnected" cleanly rather than looping on error:9.
+                    stop_relay.set()
+                    break
 
                 if self._proxy is None:
                     # Phase 1 passthrough: raw byte forwarding
