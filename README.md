@@ -2,7 +2,7 @@
 
 > **WARNING: This software controls laser cutting hardware. Use at your own risk.** The authors accept no liability for damage to equipment, materials, or injury caused by use of this software. Never leave a laser running unattended. Always power off the laser when not in use.
 
-![Diagram]("/assets/diagram.png")
+![Diagram](/assets/diagram.png)
 
 A Raspberry Pi proxy that sits between [LightBurn](https://lightburnsoftware.com/) and a GRBL laser cutter (tested on the Creality Falcon 2 Pro / ESP32-S2).
 
