@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>grbl-proxy</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>grbl-proxy</h1>
+    <span id="connection-indicator" class="indicator offline" title="WebSocket status"></span>
+  </header>
+
+  <main>
+    <section class="card" id="status-card">
+      <h2>Machine Status</h2>
+      <div class="status-grid">
+        <div class="status-row">
+          <span class="label">Proxy state</span>
+          <span id="proxy-state" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">GRBL state</span>
+          <span id="grbl-state" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Serial</span>
+          <span id="serial-connected" class="value">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Position (X, Y, Z)</span>
+          <span id="position" class="value mono">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Feed / Spindle</span>
+          <span id="feed-spindle" class="value mono">—</span>
+        </div>
+      </div>
+      <div class="button-row" style="margin-top:14px">
+        <button id="btn-home"         class="btn btn-primary"  disabled>Home</button>
+        <button id="btn-cancel-alarm" class="btn btn-danger"   disabled>Cancel Alarm</button>
+      </div>
+    </section>
+
+    <section class="card" id="job-card">
+      <h2>Job</h2>
+      <div class="progress-wrap">
+        <div class="progress-bar">
+          <div id="progress-fill" class="progress-fill" style="width:0%"></div>
+        </div>
+        <span id="progress-pct" class="progress-label">0%</span>
+      </div>
+      <div class="status-grid">
+        <div class="status-row">
+          <span class="label">File</span>
+          <span id="job-filename" class="value" style="text-align:right;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:180px">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Lines</span>
+          <span id="job-lines" class="value mono">—</span>
+        </div>
+        <div class="status-row">
+          <span class="label">Elapsed</span>
+          <span id="job-elapsed" class="value mono">—</span>
+        </div>
+      </div>
+      <div id="job-controls" class="button-row">
+        <!-- Swapped by JS: Run button -or- Pause/Resume/Cancel -->
+        <button id="btn-run" class="btn btn-success" disabled>Run</button>
+      </div>
+      <div id="job-status" class="upload-status"></div>
+    </section>
+
+    <section class="card" id="files-card">
+      <div class="files-header">
+        <h2>Files</h2>
+        <button id="btn-add-file" class="btn-add" title="Upload file">+</button>
+        <input type="file" id="gcode-file" accept=".gcode,.gc,.nc,.txt" style="display:none" />
+      </div>
+      <ul id="files-list" class="files-list">
+        <li class="files-empty">No files stored yet.</li>
+      </ul>
+    </section>
+
+    <section class="card" id="webcam-card" style="display:none">
+      <div class="webcam-header">
+        <h2>Webcam</h2>
+        <button id="btn-webcam-toggle" class="btn-collapse" title="Toggle feed">▲</button>
+      </div>
+      <div id="webcam-body">
+        <img id="webcam-img" class="webcam-feed" src="" alt="Camera feed" />
+      </div>
+    </section>
+
+    <section class="card" id="console-card">
+      <div class="console-header">
+        <h2>Console</h2>
+        <label class="toggle-label">
+          <input type="checkbox" id="hide-status" checked />
+          Hide status responses
+        </label>
+      </div>
+      <div id="console-log" class="console-log"></div>
+      <div class="console-input-row">
+        <input id="console-input" type="text" placeholder="Send GRBL command…" autocomplete="off" />
+        <button id="btn-send" class="btn btn-primary">Send</button>
+      </div>
+    </section>
+    <section class="card" id="history-card">
+      <h2>Job History</h2>
+      <table class="history-table">
+        <thead>
+          <tr>
+            <th>Date / Time</th>
+            <th>Source</th>
+            <th>Lines</th>
+            <th>Duration</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody id="history-body">
+          <tr><td colspan="5" class="history-empty">No completed jobs yet.</td></tr>
+        </tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="app.js" type="module"></script>
+</body>
+</html>

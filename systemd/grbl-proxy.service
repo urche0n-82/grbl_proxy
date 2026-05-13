@@ -1,0 +1,33 @@
+[Unit]
+Description=GRBL Proxy
+Documentation=https://github.com/your-repo/grbl-proxy
+After=network.target
+# Wants the USB serial device to be present, but don't hard-require it —
+# the proxy's reconnect loop will find the device once it appears.
+
+[Service]
+Type=simple
+User=pi
+Group=dialout
+WorkingDirectory=/home/pi/grbl-proxy
+
+# Use the venv's interpreter so no system-wide install is needed
+ExecStart=/home/pi/grbl-proxy/.venv/bin/grbl-proxy --config /home/pi/.grbl-proxy/config.yaml
+
+# Restart on crash, but not on clean exit (e.g. admin stop)
+Restart=on-failure
+RestartSec=5
+
+# systemd will send SIGTERM; the proxy handles it for clean shutdown
+TimeoutStopSec=10
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=grbl-proxy
+
+# Allow binding to privileged ports if using port 23
+# Alternatively: sudo setcap 'cap_net_bind_service=+ep' .venv/bin/python3
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
