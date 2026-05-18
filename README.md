@@ -50,7 +50,7 @@ bash install.sh
 
 The installer handles everything in one step:
 
-- Installs required system packages (`python3-venv`, `libcap2-bin`)
+- Installs required system packages
 - Adds your user to the `dialout` group for serial port access
 - Creates a Python virtual environment and installs grbl-proxy into it
 - Copies `config.yaml.example` to `~/.grbl-proxy/config.yaml`
