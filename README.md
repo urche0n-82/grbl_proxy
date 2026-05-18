@@ -37,6 +37,7 @@ A Raspberry Pi proxy that sits between [LightBurn](https://lightburnsoftware.com
 On the Raspberry Pi:
 
 ```bash
+sudo apt-get install git
 git clone https://github.com/urche0n-82/grbl_proxy.git ~/grbl-proxy
 cd ~/grbl-proxy
 ```

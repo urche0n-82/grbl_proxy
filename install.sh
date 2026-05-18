@@ -68,7 +68,7 @@ _check_python() {
 PYTHON=""
 if ! _check_python; then
     info "Python 3.11+ not found, attempting to install via apt..."
-    sudo apt-get install -y python3 python3-venv python3-dev -q
+    sudo apt-get install -y python3 python3-venv -q
     _check_python || die "Python 3.11+ is required but could not be installed. Please install it manually."
 fi
 ok "Python: $PYTHON ($("$PYTHON" --version))"
@@ -79,7 +79,7 @@ ok "Python: $PYTHON ($("$PYTHON" --version))"
 step "System packages"
 
 PKGS_NEEDED=()
-for pkg in python3-venv python3-dev libcap2-bin; do
+for pkg in python3-venv libcap2-bin; do
     if ! dpkg -s "$pkg" &>/dev/null; then
         PKGS_NEEDED+=("$pkg")
     fi
