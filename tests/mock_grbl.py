@@ -69,7 +69,7 @@ class MockSerialConnection:
         if len(line) == 1 and line.encode()[0] in grbl_protocol.REALTIME_COMMANDS:
             if line == "?":
                 self._rx_queue.put_nowait(
-                    grbl_protocol.make_status_response().rstrip("\n")
+                    grbl_protocol.make_status_response().rstrip("\r\n")
                 )
             # ! (feed hold) and ~ (cycle resume) produce no response in passthrough
             return
@@ -81,7 +81,7 @@ class MockSerialConnection:
                 continue
             if subline == "?":
                 self._rx_queue.put_nowait(
-                    grbl_protocol.make_status_response().rstrip("\n")
+                    grbl_protocol.make_status_response().rstrip("\r\n")
                 )
             else:
                 self._rx_queue.put_nowait("ok")
@@ -105,7 +105,7 @@ class MockSerialConnection:
         self._rx_queue.put_nowait(
             grbl_protocol.make_status_response(
                 state=state, mpos=(x, y, z), feed=feed, spindle=spindle
-            ).rstrip("\n")
+            ).rstrip("\r\n")
         )
 
     def last_sent_lines(self) -> list[str]:

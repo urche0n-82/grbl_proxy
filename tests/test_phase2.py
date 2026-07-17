@@ -321,7 +321,7 @@ class TestBufferingMode:
         finally:
             await server.stop()
 
-        assert response == b"ok\n"
+        assert response == b"ok\r\n"
 
     async def test_multiple_buffered_lines_each_get_ok(self, tmp_path):
         """Multiple buffered lines each get an independent ok."""
@@ -346,7 +346,7 @@ class TestBufferingMode:
         finally:
             await server.stop()
 
-        assert all(r == b"ok\n" for r in responses)
+        assert all(r == b"ok\r\n" for r in responses)
 
     async def test_status_query_during_buffering_returns_run(self, tmp_path):
         """'?' during buffering gets a synthetic <Run|...> response."""
@@ -646,5 +646,5 @@ class TestPhase1Regression:
         finally:
             await server.stop()
 
-        assert response == b"ok\n"
+        assert response == b"ok\r\n"
         assert "$H" in mock.last_sent_lines()

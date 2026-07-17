@@ -468,7 +468,7 @@ class TestProxyCoreExecuting:
             writer.write(b"G0 X50\n")
             await writer.drain()
             resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            assert resp == b"ok\n"
+            assert resp == b"ok\r\n"
 
             # Finish
             for _ in range(5):
@@ -612,7 +612,7 @@ class TestStreamerIntegration:
             writer.write(b"$$\n")  # settings query — swallowed with ok
             await writer.drain()
             resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            assert resp == b"ok\n"
+            assert resp == b"ok\r\n"
 
             for _ in range(5):
                 mock.inject("ok")
@@ -816,7 +816,7 @@ class TestStreamerErrorHandling:
             writer.write(b"$X\n")
             await writer.drain()
             resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            assert resp == b"ok\n"
+            assert resp == b"ok\r\n"
             assert core.state == ProxyState.PASSTHROUGH
 
             # Verify $X was forwarded to serial
@@ -861,7 +861,7 @@ class TestStreamerErrorHandling:
             # Now GRBL's real response arrives (simulating homing completion).
             mock.inject("ok")
             resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
-            assert resp == b"ok\n"
+            assert resp == b"ok\r\n"
 
             # And nothing further follows — exactly one ok for one command.
             with pytest.raises(asyncio.TimeoutError):

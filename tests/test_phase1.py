@@ -224,7 +224,7 @@ class TestTcpRelay:
         finally:
             await server.stop()
 
-        assert response == b"ok\n"
+        assert response == b"ok\r\n"
         assert "$H" in mock_serial.last_sent_lines()
 
     async def test_status_query_response(self, mock_serial):
@@ -261,7 +261,11 @@ class TestTcpRelay:
         finally:
             await server.stop()
 
-        assert response == b"ok\n"
+        # Must be CR+LF terminated to match a real GRBL device: read_line()
+        # strips whatever the firmware sent, and a bare "\n" back to LightBurn
+        # can leave a strict parser waiting on an "incomplete" line (BUSY lock).
+        assert response == b"ok\r\n"
+        assert response.endswith(b"\r\n")
 
     async def test_new_client_drops_old(self, mock_serial):
         """Connecting a second client causes the first to get EOF."""
@@ -279,7 +283,7 @@ class TestTcpRelay:
             # First connection should be closed — reading should return EOF quickly
             try:
                 data = await asyncio.wait_for(reader1.read(100), timeout=1.0)
-                assert data == b"" or data == b"error:9\n"
+                assert data == b"" or data == b"error:9\r\n"
             except asyncio.TimeoutError:
                 pytest.fail("Old connection was not dropped within 1s")
 
@@ -314,7 +318,7 @@ class TestTcpRelay:
         finally:
             await server.stop()
 
-        assert all(r == b"ok\n" for r in responses)
+        assert all(r == b"ok\r\n" for r in responses)
 
     async def test_alarm_forwarded(self, mock_serial):
         """ALARM responses from serial are forwarded to LightBurn."""
@@ -330,7 +334,7 @@ class TestTcpRelay:
         finally:
             await server.stop()
 
-        assert line == b"ALARM:1\n"
+        assert line == b"ALARM:1\r\n"
 
 
 # ---------------------------------------------------------------------------

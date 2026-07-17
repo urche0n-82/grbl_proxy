@@ -236,6 +236,7 @@ class ProxyCore:
                 # Passthrough: forward to serial
                 try:
                     await serial_conn.write(bytes([byte]))
+                    logger.debug("TCP→Serial realtime: b'?' (state=%s)", self._state.value)
                 except Exception as e:
                     logger.debug("Serial unavailable for realtime '?': %s", e)
             return True
@@ -293,6 +294,7 @@ class ProxyCore:
         # Forward the command to serial regardless (BUFFERING path, PASSTHROUGH, etc.)
         try:
             await serial_conn.write(bytes([byte]))
+            logger.debug("TCP→Serial realtime: 0x%02x (state=%s)", byte, self._state.value)
         except Exception as e:
             logger.debug("Serial unavailable for realtime command: %s", e)
         return True
@@ -347,7 +349,7 @@ class ProxyCore:
                 # outstanding to attach it to.
             else:
                 logger.debug("Command rejected in ERROR state: %s", line)
-                writer.write(b"error:9\n")
+                writer.write(b"error:9" + grbl_protocol.LINE_TERMINATOR.encode())
                 await writer.drain()
 
         elif self._state == ProxyState.BUFFERING:
@@ -671,8 +673,8 @@ class ProxyCore:
 
     @staticmethod
     async def _spoof_ok(writer: asyncio.StreamWriter) -> None:
-        """Send a synthetic 'ok' response to LightBurn."""
-        writer.write(b"ok\n")
+        """Send a synthetic 'ok' response to LightBurn (CR+LF like real GRBL)."""
+        writer.write(b"ok" + grbl_protocol.LINE_TERMINATOR.encode())
         await writer.drain()
 
     # ------------------------------------------------------------------

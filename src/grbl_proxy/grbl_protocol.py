@@ -20,6 +20,15 @@ _REALTIME_BASIC = frozenset(b"?!~\x18")
 _REALTIME_EXTENDED = frozenset(range(0x80, 0xA2))
 REALTIME_COMMANDS = _REALTIME_BASIC | _REALTIME_EXTENDED
 
+# GRBL terminates every response line (ok, error:N, status reports, welcome
+# banner) with CR+LF. A real GRBL-over-TCP device that LightBurn talks to
+# directly therefore always sends "\r\n". The proxy must match this exactly:
+# some LightBurn builds have a strict line parser that treats a bare "\n" as an
+# incomplete line and never marks the command acknowledged (manifesting as a
+# permanent "BUSY" state). Use this for every line the proxy sends BACK to
+# LightBurn. Commands the proxy sends TO GRBL keep "\n" (GRBL accepts either).
+LINE_TERMINATOR = "\r\n"
+
 # Motion/laser G-code prefixes that indicate a job stream vs interactive use
 MOTION_COMMAND_PREFIXES = ("G0", "G1", "G2", "G3", "M3", "M4", "M5", "S")
 
@@ -176,6 +185,6 @@ def make_status_response(
     feed: int = 0,
     spindle: int = 0,
 ) -> str:
-    """Build a synthetic GRBL status response string."""
+    """Build a synthetic GRBL status response string (CR+LF terminated)."""
     x, y, z = mpos
-    return f"<{state}|MPos:{x:.3f},{y:.3f},{z:.3f}|FS:{feed},{spindle}>\n"
+    return f"<{state}|MPos:{x:.3f},{y:.3f},{z:.3f}|FS:{feed},{spindle}>{LINE_TERMINATOR}"

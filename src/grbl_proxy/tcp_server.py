@@ -339,7 +339,7 @@ class TcpServer:
                     logger.warning("Serial disconnected during relay: %s", e)
                     # Serial dropped mid-relay — notify LightBurn with an alarm.
                     try:
-                        writer.write(b"error:9\n")
+                        writer.write(b"error:9" + grbl_protocol.LINE_TERMINATOR.encode())
                         await writer.drain()
                     except (BrokenPipeError, ConnectionResetError):
                         pass
@@ -366,7 +366,10 @@ class TcpServer:
                     if self._proxy is not None:
                         self._proxy.update_last_status(status)
 
-            encoded = (line + "\n").encode()
+            # Re-terminate with CR+LF to match a real GRBL device — read_line()
+            # stripped whatever the firmware used. A bare "\n" here can leave a
+            # strict LightBurn parser waiting for a line it considers complete.
+            encoded = (line + grbl_protocol.LINE_TERMINATOR).encode()
             logger.debug("Serial→TCP: %r", encoded)
 
             try:
