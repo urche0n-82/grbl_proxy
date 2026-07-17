@@ -223,6 +223,23 @@ async def test_idle_poll_skips_when_executing(tmp_path):
     assert serial.write.await_count == 0
 
 
+async def test_idle_poll_skips_when_passthrough(tmp_path):
+    """Idle poll must NOT send '?' during PASSTHROUGH — a LightBurn client is
+    connected and idle in this state, so proxy-injected queries would be
+    unsolicited traffic interleaved with LightBurn's own request/response
+    stream (regression test for the $H/BUSY-lock hang)."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+    core._state = ProxyState.PASSTHROUGH
+
+    serial = _make_serial(connected=True)
+    core.start_idle_poll(serial, poll_hz=10.0)
+    await asyncio.sleep(0.25)
+    core.stop_idle_poll()
+
+    assert serial.write.await_count == 0
+
+
 async def test_idle_poll_skips_when_disconnected_serial(tmp_path):
     """Idle poll must NOT send '?' if serial is not connected."""
     job_cfg = JobConfig(storage_dir=str(tmp_path))

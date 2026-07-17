@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import socket
 
 from grbl_proxy import grbl_protocol
 from grbl_proxy.serial_conn import SerialDisconnectedError
@@ -88,6 +89,16 @@ class TcpServer:
     ) -> None:
         peer = writer.get_extra_info("peername")
         logger.info("TCP client connected: %s", peer)
+
+        # Disable Nagle's algorithm: this protocol is small, latency-sensitive
+        # line-at-a-time traffic (a lone "ok\n", a single status report). Left
+        # at the default, Nagle + delayed ACKs can stall those packets.
+        sock = writer.get_extra_info("socket")
+        if sock is not None:
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError as e:
+                logger.debug("Could not set TCP_NODELAY: %s", e)
 
         # Drop any existing connection before taking the new one
         # (_drop_current_client also calls on_client_disconnected if proxy set)

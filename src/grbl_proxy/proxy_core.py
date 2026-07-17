@@ -491,8 +491,8 @@ class ProxyCore:
     def start_idle_poll(self, serial_conn: "SerialConnection", poll_hz: float = 1.0) -> None:
         """Start a background task that sends '?' to GRBL at poll_hz rate.
 
-        Only runs when no LightBurn client is connected (DISCONNECTED or PASSTHROUGH).
-        The response is read by whoever owns the serial read path at that moment.
+        Only runs while DISCONNECTED (no LightBurn client connected). The
+        response is read by whoever owns the serial read path at that moment.
         """
         if self._idle_poll_task is not None:
             return
@@ -513,8 +513,11 @@ class ProxyCore:
         while True:
             try:
                 await asyncio.sleep(interval)
-                # Only send when no active job and serial is connected
-                if self._state not in (ProxyState.DISCONNECTED, ProxyState.PASSTHROUGH):
+                # Only send when no TCP client is connected. PASSTHROUGH means a
+                # client IS connected and idle — polling there would inject
+                # unsolicited '?' queries onto the wire that LightBurn never
+                # asked for, interleaved with its own command/response traffic.
+                if self._state is not ProxyState.DISCONNECTED:
                     continue
                 if not serial_conn.is_connected:
                     continue
@@ -522,11 +525,10 @@ class ProxyCore:
                     await serial_conn.write(b"?")
                 except Exception:
                     continue
-                # When no TCP client is connected, _serial_to_tcp isn't running so
-                # we must read and parse responses ourselves. Drain all pending lines
-                # so web console commands also get their replies captured.
-                if self._state == ProxyState.DISCONNECTED:
-                    await self._drain_serial(serial_conn)
+                # No TCP client is connected, so _serial_to_tcp isn't running —
+                # we must read and parse responses ourselves. Drain all pending
+                # lines so web console commands also get their replies captured.
+                await self._drain_serial(serial_conn)
             except asyncio.CancelledError:
                 break
 
