@@ -35,6 +35,7 @@ def _make_mock_core(state: ProxyState = ProxyState.PASSTHROUGH) -> MagicMock:
     core._streamer = None
     core._buffer = None
     core._serial_conn = None
+    core._has_tcp_client = False
     return core
 
 
@@ -272,6 +273,7 @@ async def test_get_console_empty(client):
 
 async def test_post_console_passthrough(proxy_control, console, tmp_path):
     core = _make_mock_core(ProxyState.PASSTHROUGH)
+    core._has_tcp_client = False
     serial = AsyncMock()
     core._serial_conn = serial
 
@@ -283,6 +285,25 @@ async def test_post_console_passthrough(proxy_control, console, tmp_path):
         resp = await c.post("/api/console", json={"command": "$$"})
     assert resp.status_code == 200
     serial.write.assert_awaited_once_with(b"$$\n")
+
+
+async def test_post_console_rejected_when_lightburn_connected(proxy_control, console, tmp_path):
+    """A LightBurn client owns the serial ok/error stream while connected —
+    a console command's 'ok' would relay into LightBurn's stream indistinguishable
+    from a response to its own command, desyncing its command/ack accounting."""
+    core = _make_mock_core(ProxyState.PASSTHROUGH)
+    core._has_tcp_client = True
+    serial = AsyncMock()
+    core._serial_conn = serial
+
+    status = ProxyStatus(core)
+    control = ProxyControl(core)
+    cfg = _make_config(tmp_path)
+    app = create_app(status, control, console, cfg)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post("/api/console", json={"command": "$$"})
+    assert resp.status_code == 409
+    serial.write.assert_not_awaited()
 
 
 async def test_post_console_wrong_state(client):

@@ -828,6 +828,50 @@ class TestStreamerErrorHandling:
         finally:
             await server.stop()
 
+    async def test_error_state_dollar_h_does_not_double_ack(self, tmp_path):
+        """In ERROR state, clearing via $H must NOT get an immediate spoofed
+        'ok' plus GRBL's real (possibly delayed, e.g. homing) 'ok' — that
+        would double-ack a single LightBurn command and desync its counting.
+
+        Uses auto_respond=False so GRBL's 'ok' only arrives once explicitly
+        injected, simulating a homing cycle that takes a moment to complete.
+        """
+        server, mock, core = _make_server(
+            _BASE_PORT + 14, tmp_path / "jobs3", auto_respond=False
+        )
+        await server.start()
+        try:
+            core._state = ProxyState.ERROR
+            core._serial_readable.set()
+
+            reader, writer = await _connect(_BASE_PORT + 14)
+            await asyncio.sleep(0.02)
+
+            writer.write(b"$H\n")
+            await writer.drain()
+
+            # No response should arrive yet — GRBL hasn't been given one,
+            # and the proxy must not spoof one anymore.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readline(), timeout=0.2)
+
+            assert core.state == ProxyState.PASSTHROUGH
+            assert "$H" in mock.last_sent_lines()
+
+            # Now GRBL's real response arrives (simulating homing completion).
+            mock.inject("ok")
+            resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            assert resp == b"ok\n"
+
+            # And nothing further follows — exactly one ok for one command.
+            with pytest.raises(asyncio.TimeoutError):
+                await asyncio.wait_for(reader.readline(), timeout=0.2)
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
     async def test_feed_hold_then_resume_completes_job(self, tmp_path):
         """Feed hold (!) then resume (~) during execution completes the job.
 

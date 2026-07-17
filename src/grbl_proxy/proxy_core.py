@@ -338,8 +338,13 @@ class ProxyCore:
                     logger.debug("Serial write error for error clear: %s", e)
                 self._state = ProxyState.PASSTHROUGH
                 self._last_error = None
-                writer.write(b"ok\n")
-                await writer.drain()
+                # Do NOT spoof an 'ok' here — GRBL's real ok/error for this
+                # command now flows back through the normal Passthrough relay
+                # (state just transitioned above). Spoofing one immediately
+                # would double-ack: LightBurn would get this synthetic ok now
+                # and GRBL's real one moments later (or seconds later, if $H
+                # triggers actual homing), with no command it thinks is still
+                # outstanding to attach it to.
             else:
                 logger.debug("Command rejected in ERROR state: %s", line)
                 writer.write(b"error:9\n")

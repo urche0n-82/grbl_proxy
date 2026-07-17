@@ -282,12 +282,23 @@ class ProxyControl:
         return True, "ok"
 
     async def send_console(self, command: str) -> tuple[bool, str]:
-        """Send an arbitrary command to GRBL. Valid in PASSTHROUGH, DISCONNECTED, or ERROR state."""
+        """Send an arbitrary command to GRBL. Valid in DISCONNECTED, or in
+        PASSTHROUGH/ERROR only when no LightBurn client is connected.
+
+        A LightBurn client owns the serial ok/error stream while connected:
+        _serial_to_tcp relays every line GRBL sends straight back to it with
+        no correlation to who asked for what. A console command written here
+        while LightBurn is connected would get its 'ok' relayed into
+        LightBurn's stream indistinguishable from a response to LightBurn's
+        own command, desyncing its command/ack accounting.
+        """
         from grbl_proxy.proxy_core import ProxyState
 
         core = self._core
         if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED, ProxyState.ERROR):
             return False, f"Cannot send console command in state {core._state.value}"
+        if core._has_tcp_client:
+            return False, "Cannot send console command while LightBurn is connected"
         serial = self._serial_conn()
         if serial is None:
             return False, "No serial connection"
