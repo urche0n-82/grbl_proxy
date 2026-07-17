@@ -61,30 +61,30 @@ class MockSerialConnection:
         if not self._auto_respond:
             return
 
-        line = data.decode(errors="replace").strip()
-        if not line:
-            return
-
-        # Real-time single-byte commands
-        if len(line) == 1 and line.encode()[0] in grbl_protocol.REALTIME_COMMANDS:
-            if line == "?":
-                self._rx_queue.put_nowait(
-                    grbl_protocol.make_status_response().rstrip("\r\n")
-                )
-            # ! (feed hold) and ~ (cycle resume) produce no response in passthrough
-            return
-
-        # Multi-line data may arrive in one write() call if LightBurn batches
-        for subline in line.splitlines():
-            subline = subline.strip()
-            if not subline:
-                continue
-            if subline == "?":
-                self._rx_queue.put_nowait(
-                    grbl_protocol.make_status_response().rstrip("\r\n")
-                )
+        # GRBL's serial ISR plucks real-time bytes out of the stream wherever
+        # they appear — they never reach the line buffer and never earn an 'ok'.
+        # '?' answers with a status report; '!' and '~' answer with nothing.
+        remaining = bytearray()
+        for b in data:
+            if b in grbl_protocol.REALTIME_COMMANDS:
+                if b == ord("?"):
+                    self._rx_queue.put_nowait(
+                        grbl_protocol.make_status_response().rstrip("\r\n")
+                    )
             else:
-                self._rx_queue.put_nowait("ok")
+                remaining.append(b)
+
+        # Whatever is left is line data. GRBL acks every newline-terminated
+        # line with 'ok' — INCLUDING an empty one, which protocol_main_loop
+        # treats as a no-op sync point:
+        #     else if (line[0] == 0) { report_status_message(STATUS_OK); }
+        # This is what LightBurn's "?\n" relies on: the ISR takes the '?' and
+        # the leftover newline still earns its 'ok'.
+        # split("\n")[:-1] yields only complete (terminated) lines, so a
+        # partial write with no trailing newline correctly acks nothing yet.
+        text = remaining.decode(errors="replace")
+        for _ in text.split("\n")[:-1]:
+            self._rx_queue.put_nowait("ok")
 
     # --- Test helpers ---
 

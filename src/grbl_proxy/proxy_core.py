@@ -312,6 +312,11 @@ class ProxyCore:
 
         In BUFFERING: intercepts the line, writes it to the buffer, and
         spoofs an 'ok' response back to LightBurn. Detects job end.
+
+        `line` may be empty: GRBL acks a bare newline with 'ok' (protocol.c
+        treats an empty line as a no-op sync point), and LightBurn relies on
+        that ok when it sends "?\\n". Empty lines must therefore be routed,
+        not dropped.
         """
         if self._state == ProxyState.PASSTHROUGH:
             if self._check_job_start(line):
@@ -330,6 +335,13 @@ class ProxyCore:
             await self._spoof_ok(writer)
 
         elif self._state == ProxyState.ERROR:
+            # An empty line is a no-op sync point — GRBL acks it with 'ok' even
+            # in alarm state (the empty-line check precedes the alarm gate in
+            # protocol_main_loop), so it must not be rejected with error:9.
+            if not line:
+                await self._spoof_ok(writer)
+                return
+
             # Blocked until operator clears the error with $X or $H
             upper = line.strip().upper()
             if upper in ("$X", "$H"):
@@ -353,9 +365,16 @@ class ProxyCore:
                 await writer.drain()
 
         elif self._state == ProxyState.BUFFERING:
+            # Blank line: ack it like GRBL would, but keep it out of the job
+            # file — it carries no G-code and would just pad the buffer.
+            if not line:
+                await self._spoof_ok(writer)
+                self._reset_idle_timeout()
+                return
+
             # Check for end marker first (don't write the marker line itself
             # but do finalize — the file is self-contained without it)
-            if _normalize_gcode(line) == _normalize_gcode(self._cfg.end_marker):
+            if self._check_job_end(line):
                 await self._finalize_job()
                 await self._spoof_ok(writer)
                 return
@@ -601,8 +620,24 @@ class ProxyCore:
     # ------------------------------------------------------------------
 
     def _check_job_start(self, line: str) -> bool:
-        """Return True if this line should trigger a transition to Buffering."""
+        """Return True if this line should trigger a transition to Buffering.
+
+        An unconfigured (blank) marker never matches — otherwise every blank
+        line LightBurn sends would trigger it.
+        """
+        if not self._cfg.start_marker.strip():
+            return False
         return _normalize_gcode(line) == _normalize_gcode(self._cfg.start_marker)
+
+    def _check_job_end(self, line: str) -> bool:
+        """Return True if this line is the configured end-of-job marker.
+
+        end_marker defaults to "" (LightBurn signals end with M30 instead), so
+        a blank marker must never match — including against a blank line.
+        """
+        if not self._cfg.end_marker.strip():
+            return False
+        return _normalize_gcode(line) == _normalize_gcode(self._cfg.end_marker)
 
     async def _enter_buffering(self, writer: asyncio.StreamWriter) -> None:
         """Transition to BUFFERING and open the job buffer."""

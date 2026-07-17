@@ -247,12 +247,16 @@ class TcpServer:
             if byte == ord("\n"):
                 line = self._line_buf.decode(errors="replace").rstrip("\r\n")
                 self._line_buf.clear()
-                if line:  # skip blank lines
-                    logger.debug("Route [%s]: %s", self._proxy.state.value, line)
-                    try:
-                        await self._proxy.process_client_line(line, writer, self._serial)
-                    except SerialDisconnectedError as e:
-                        logger.warning("Serial unavailable during routing: %s", e)
+                # Blank lines are NOT skipped. GRBL answers a bare newline with
+                # "ok" (an empty line is a no-op sync point), and LightBurn
+                # sends "?\n" — the "?" is consumed as a real-time byte above,
+                # leaving an empty line whose "ok" LightBurn waits for before
+                # sending its next command. Dropping it here stalls the client.
+                logger.debug("Route [%s]: %r", self._proxy.state.value, line)
+                try:
+                    await self._proxy.process_client_line(line, writer, self._serial)
+                except SerialDisconnectedError as e:
+                    logger.warning("Serial unavailable during routing: %s", e)
 
     async def _serial_to_tcp(
         self, writer: asyncio.StreamWriter, stop_relay: asyncio.Event

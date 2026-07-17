@@ -252,6 +252,81 @@ class TestProxyCoreUnit:
 # ---------------------------------------------------------------------------
 
 
+class TestBlankLineAck:
+    """LightBurn sends "?\\n": the '?' is consumed as a real-time byte and the
+    leftover empty line must still reach GRBL to earn its 'ok'.
+
+    GRBL's protocol_main_loop acks an empty line as a no-op sync point:
+        else if (line[0] == 0) { report_status_message(STATUS_OK); }
+    Newer LightBurn builds send "?\\n" through the command pipeline (e.g. when
+    framing) and block until that 'ok' arrives. Swallowing the blank line
+    strands them at "BUSY 100%" with no outstanding command they can retire.
+    """
+
+    async def test_question_mark_newline_gets_status_and_ok(self, tmp_path):
+        server, mock, core = _make_server(_BASE_PORT + 20, tmp_path / "jobs")
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 20)
+            writer.write(b"?\n")
+            await writer.drain()
+
+            status = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            ack = await asyncio.wait_for(reader.readline(), timeout=2.0)
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+        assert status.startswith(b"<")
+        assert ack == b"ok\r\n"
+        # The bare newline must actually reach GRBL, not be swallowed.
+        assert b"\n" in b"".join(mock.tx_log)
+
+    async def test_blank_line_forwarded_and_acked(self, tmp_path):
+        """A bare newline on its own is a GRBL no-op sync point → one 'ok'."""
+        server, mock, core = _make_server(_BASE_PORT + 21, tmp_path / "jobs")
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 21)
+            writer.write(b"\n")
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+        assert resp == b"ok\r\n"
+
+    async def test_blank_line_does_not_finalize_job_with_empty_end_marker(
+        self, tmp_path
+    ):
+        """end_marker defaults to "" — a blank line must not match it and end
+        the job. Guard against the empty-marker collision."""
+        server, mock, core = _make_server(_BASE_PORT + 22, tmp_path / "jobs")
+        core._cfg.end_marker = ""  # the shipped default
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 22)
+            await _enter_buffering(reader, writer)
+            await asyncio.sleep(0.05)
+            assert core.state == ProxyState.BUFFERING
+
+            writer.write(b"\n")
+            await writer.drain()
+            resp = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            assert resp == b"ok\r\n"
+            # Still buffering — the blank line must not have ended the job.
+            assert core.state == ProxyState.BUFFERING
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+
 class TestBufferingMode:
     async def test_passthrough_before_job_start(self, tmp_path):
         """A line sent before the start marker is forwarded to serial."""
