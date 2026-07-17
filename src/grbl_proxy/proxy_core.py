@@ -692,8 +692,26 @@ class ProxyCore:
         self._start_streamer(meta)
 
     async def _write_synthetic_status(self, writer: asyncio.StreamWriter) -> None:
-        """Respond to a '?' query with a synthesized status based on current state."""
-        grbl_state = "Hold" if self._state == ProxyState.PAUSED else "Run"
+        """Respond to a '?' query with a synthesized status based on current state.
+
+        State reporting depends on the proxy state:
+          - PAUSED: report Hold (a real feed hold is in effect).
+          - EXECUTING: report the REAL machine state cached from the streamer's
+            polls (Run while cutting, Idle once the planner drains). Reflecting
+            the true state — rather than a hardcoded "Run" — surfaces a buffer
+            lock: if the machine is Idle but we're still EXECUTING, the job
+            finished on the machine while the proxy hasn't released streaming.
+          - BUFFERING/other synthetic paths: report Run. The machine is actually
+            idle while we capture the job to disk, but LightBurn must believe a
+            job is progressing, so the real (idle) state must NOT leak here.
+        """
+        if self._state == ProxyState.PAUSED:
+            grbl_state = "Hold"
+        elif self._state == ProxyState.EXECUTING:
+            grbl_state = (self._last_status or {}).get("state") or "Run"
+        else:
+            grbl_state = "Run"
+
         if self._last_status is not None:
             mpos = self._last_status.get("mpos", (0.0, 0.0, 0.0))
             fs = self._last_status.get("fs", (0, 0))

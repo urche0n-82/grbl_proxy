@@ -25,6 +25,10 @@ logger = logging.getLogger(__name__)
 
 RX_BUFFER_SIZE = 128   # GRBL's receive buffer in bytes
 POLL_INTERVAL = 0.25   # seconds — 4 Hz status polling during execution
+# Consecutive Idle status reports that confirm a job is physically complete
+# when the final ok(s) never arrive. At 4 Hz polling this is ~0.75s of
+# sustained Idle — long enough to rule out a momentary pre-motion Idle.
+IDLE_COMPLETE_POLLS = 3
 
 
 @dataclass
@@ -197,6 +201,16 @@ class GrblStreamer:
                 if grbl_protocol.is_ok(response):
                     if line_lengths:
                         buffer_used -= line_lengths.popleft()
+                    else:
+                        # An 'ok' with nothing in flight means our send/ack
+                        # accounting has desynced (an extra/duplicate ok, or a
+                        # miscount). Surface it — a silent swallow here hides the
+                        # very thing that later wedges the trailing drain.
+                        logger.warning(
+                            "Streamer: received 'ok' with no in-flight line — "
+                            "send/ack desync (after %d lines sent)",
+                            self._lines_sent,
+                        )
                 elif grbl_protocol.is_error(response):
                     error_code = grbl_protocol.get_error_code(response)
                     logger.error(
@@ -236,13 +250,33 @@ class GrblStreamer:
             line_lengths.append(line_bytes)
             self._lines_sent += 1
 
-        # All lines sent — drain remaining in-flight oks
+        # All lines sent — drain remaining in-flight oks.
+        #
+        # GRBL should emit exactly one ok per line, but that can't be relied on
+        # for completion: some firmware (notably ESP32 GRBL forks like the
+        # Falcon 2 Pro) don't send a standard ok for M2/M30, and a single
+        # dropped/mis-framed ok has the same effect. Either way line_lengths
+        # never empties and this loop would spin forever, wedging the proxy in
+        # EXECUTING while the machine is already parked and idle.
+        #
+        # Guard with an authoritative completion signal: once every line is on
+        # the machine, a sustained Idle state means the planner is empty and the
+        # job is physically done. This is only reached after all lines are sent,
+        # so it can never truncate a job mid-stream. Idle is required to persist
+        # across a few polls so a momentary pre-motion Idle can't trip it.
+        logger.debug(
+            "Streamer: all %d lines sent, draining %d trailing ack(s)",
+            self._lines_sent,
+            len(line_lengths),
+        )
+        idle_polls = 0
         while line_lengths:
             response = await self._serial.read_line()
             if not response:
                 continue
             if grbl_protocol.is_ok(response):
                 line_lengths.popleft()
+                idle_polls = 0
             elif grbl_protocol.is_error(response):
                 error_code = grbl_protocol.get_error_code(response)
                 logger.error(
@@ -273,10 +307,25 @@ class GrblStreamer:
                     total_lines=len(lines),
                 )
             elif grbl_protocol.is_status_report(response):
-                if self._on_status:
-                    status = grbl_protocol.parse_status_report(response)
-                    if status:
+                status = grbl_protocol.parse_status_report(response)
+                if status:
+                    if self._on_status:
                         self._on_status(status)
+                    if status.get("state") == "Idle":
+                        idle_polls += 1
+                        if idle_polls >= IDLE_COMPLETE_POLLS:
+                            logger.warning(
+                                "Streamer: GRBL reached Idle with %d line(s) "
+                                "still unacked — treating job as complete. "
+                                "GRBL likely did not ok the final command "
+                                "(e.g. M2/M30). Sent %d/%d lines.",
+                                len(line_lengths),
+                                self._lines_sent,
+                                len(lines),
+                            )
+                            break
+                    else:
+                        idle_polls = 0
 
         return StreamerResult(
             completed=True,

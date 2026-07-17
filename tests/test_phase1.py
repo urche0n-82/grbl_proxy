@@ -141,30 +141,6 @@ class TestMakeStatusResponse:
         assert "FS:3000,255" in r
 
 
-class TestStripStatusField:
-    def test_removes_bf_field(self):
-        line = "<Idle|MPos:0.025,0.025,0.000|Bf:127,65535|FS:0,0>"
-        assert (
-            grbl_protocol.strip_status_field(line, "Bf")
-            == "<Idle|MPos:0.025,0.025,0.000|FS:0,0>"
-        )
-
-    def test_preserves_other_fields(self):
-        line = "<Idle|MPos:0,0,0|Bf:127,65535|FS:5657,0|Ov:100,100,100|A:S>"
-        assert (
-            grbl_protocol.strip_status_field(line, "Bf")
-            == "<Idle|MPos:0,0,0|FS:5657,0|Ov:100,100,100|A:S>"
-        )
-
-    def test_noop_when_field_absent(self):
-        line = "<Idle|MPos:0,0,0|FS:0,0>"
-        assert grbl_protocol.strip_status_field(line, "Bf") == line
-
-    def test_noop_on_non_status_line(self):
-        assert grbl_protocol.strip_status_field("ok", "Bf") == "ok"
-        assert grbl_protocol.strip_status_field("error:9", "Bf") == "error:9"
-
-
 # ---------------------------------------------------------------------------
 # config.py tests
 # ---------------------------------------------------------------------------
@@ -360,9 +336,15 @@ class TestTcpRelay:
 
         assert line == b"ALARM:1\r\n"
 
-    async def test_bf_field_stripped_from_status_to_lightburn(self, mock_serial):
-        """The firmware-specific Bf field is removed from status reports before
-        they reach LightBurn (Bf:127,65535 jams a strict host buffer meter)."""
+    async def test_status_report_forwarded_verbatim(self, mock_serial):
+        """Status reports reach LightBurn unmodified — the proxy does not
+        rewrite GRBL's fields. Only the line terminator is normalised to CR+LF.
+
+        Bf is firmware-specific (the Falcon 2 Pro reports Bf:127,65535 — a
+        128-block planner and an unbounded 0xFFFF RX buffer) but is passed
+        through as-is: rewriting the wire protocol risks new breakage, and Bf
+        was not the cause of the LightBurn stall.
+        """
         mock_no_auto = MockSerialConnection(auto_respond=False)
         server = TcpServer("127.0.0.1", _BASE_PORT + 7, mock_no_auto)
         await server.start()
@@ -375,8 +357,7 @@ class TestTcpRelay:
         finally:
             await server.stop()
 
-        assert line == b"<Idle|MPos:0.025,0.025,0.000|FS:0,0>\r\n"
-        assert b"Bf:" not in line
+        assert line == b"<Idle|MPos:0.025,0.025,0.000|Bf:127,65535|FS:0,0>\r\n"
 
 
 # ---------------------------------------------------------------------------

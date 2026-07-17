@@ -314,9 +314,24 @@ class TcpServer:
             # Wait for the in-flight read thread to finish (can't cancel a
             # thread) so the serial fd is not accessed concurrently, then
             # signal idle and loop back to the serial_readable check.
+            #
+            # The in-flight read's result is dropped here. That is safe only
+            # because GRBL is silent during Buffering (the job is spoofed, not
+            # sent), so this read is a timeout. If it ever returns a real line,
+            # that line is lost — log it loudly so a genuine drop is visible
+            # rather than silently corrupting the streamer's ok accounting.
             if self._proxy is not None and self._proxy.serial_yield.is_set():
                 try:
-                    await asyncio.wait_for(asyncio.shield(read_task), timeout=2.0)
+                    dropped = await asyncio.wait_for(
+                        asyncio.shield(read_task), timeout=2.0
+                    )
+                    if dropped:
+                        logger.warning(
+                            "Serial handoff dropped an in-flight line at the "
+                            "Executing transition: %r — GRBL was expected to be "
+                            "silent during Buffering.",
+                            dropped,
+                        )
                 except (asyncio.TimeoutError, Exception):
                     read_task.cancel()
                 self._proxy.serial_read_idle.set()
@@ -363,17 +378,14 @@ class TcpServer:
             serial_was_connected = True  # successful read confirms serial is live
 
             # Snoop on status reports: log and cache for synthetic responses.
-            # Cache the FULL report (with Bf) for the dashboard, then strip the
-            # firmware-specific Bf field before forwarding to LightBurn — its
-            # out-of-range values (Bf:127,65535) can jam a strict host parser's
-            # buffer-fill accounting ("BUSY 100%"). Stock GRBL omits Bf by default.
+            # The report itself is forwarded verbatim — the proxy does not
+            # rewrite GRBL's status fields.
             if grbl_protocol.is_status_report(line):
                 status = grbl_protocol.parse_status_report(line)
                 if status:
                     logger.debug("Machine status: %s", status)
                     if self._proxy is not None:
                         self._proxy.update_last_status(status)
-                line = grbl_protocol.strip_status_field(line, "Bf")
 
             # Re-terminate with CR+LF to match a real GRBL device — read_line()
             # stripped whatever the firmware used. A bare "\n" here can leave a

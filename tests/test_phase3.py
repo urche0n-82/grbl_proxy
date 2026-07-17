@@ -15,7 +15,7 @@ import pytest
 
 from grbl_proxy.config import AutoDetectConfig, JobConfig
 from grbl_proxy.proxy_core import ProxyCore, ProxyState
-from grbl_proxy.streamer import GrblStreamer, StreamerResult
+from grbl_proxy.streamer import IDLE_COMPLETE_POLLS, GrblStreamer, StreamerResult
 from grbl_proxy.tcp_server import TcpServer
 from tests.mock_grbl import MockSerialConnection
 
@@ -209,6 +209,70 @@ class TestStreamerUnit:
         assert not r.completed
         assert r.alarm_code == 1
         assert r.error_code is None
+
+    async def test_completes_on_idle_when_final_ok_missing(self, tmp_path):
+        """If GRBL never acks the last line (e.g. an ESP32 fork that doesn't
+        emit a standard ok for M2), the streamer must still complete once GRBL
+        reports Idle — the machine is physically done. Without this the trailing
+        drain spins forever and wedges the proxy in EXECUTING.
+
+        Regression for the observed hang: a 139-line frame job finished on the
+        machine (returned to origin, Idle) but the proxy stayed EXECUTING and
+        swallowed the next job.
+        """
+        gcode = tmp_path / "test.gcode"
+        _write_gcode_file(gcode, ["G0 X10", "G1 Y20", "M2"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            mock.inject("ok")   # ack line 1
+            mock.inject("ok")   # ack line 2
+            # line 3 (M2) intentionally NOT acked — simulates the firmware quirk.
+            # Machine finishes and reports Idle on subsequent polls.
+            for _ in range(IDLE_COMPLETE_POLLS + 1):
+                await asyncio.sleep(0.03)
+                mock.inject_status(state="Idle")
+
+        task = asyncio.create_task(streamer.run())
+        await feed()
+        await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert r.completed
+        assert r.cancelled is False
+        assert r.error_code is None
+        assert r.alarm_code is None
+        assert r.lines_sent == 3
+
+    async def test_run_state_does_not_falsely_complete(self, tmp_path):
+        """A Run status in the trailing drain must NOT complete the job — only
+        sustained Idle does. Guards the Idle fallback against premature exit."""
+        gcode = tmp_path / "test.gcode"
+        _write_gcode_file(gcode, ["G0 X10", "M2"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            mock.inject("ok")  # ack line 1
+            # Machine still moving: Run reports must not trigger completion.
+            for _ in range(IDLE_COMPLETE_POLLS + 2):
+                await asyncio.sleep(0.03)
+                mock.inject_status(state="Run", x=5.0)
+            # Then the real final ok arrives → normal completion.
+            mock.inject("ok")
+
+        task = asyncio.create_task(streamer.run())
+        await feed()
+        await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert r.completed
+        assert r.lines_sent == 2
 
     async def test_cancel_stops_streaming_cleanly(self, tmp_path):
         """cancel() stops streaming with cancelled=True.
@@ -441,6 +505,65 @@ class TestProxyCoreExecuting:
             await writer.wait_closed()
         finally:
             await server.stop()
+
+    async def test_synthetic_status_reflects_real_state_during_executing(self, tmp_path):
+        """During EXECUTING the synthetic '?' reply mirrors the real cached
+        machine state. If GRBL is Idle while we're still EXECUTING, that is a
+        buffer-lock symptom and must be visible, not masked by a hardcoded Run.
+        BUFFERING keeps the Run illusion; PAUSED reports Hold.
+        """
+        cfg = _make_job_cfg(tmp_path / "jobs")
+        core = ProxyCore(cfg, idle_timeout_s=0.1)
+
+        class _FakeWriter:
+            def __init__(self) -> None:
+                self.buf = bytearray()
+
+            def write(self, b: bytes) -> None:
+                self.buf += b
+
+            async def drain(self) -> None:
+                pass
+
+        async def synth(state: ProxyState, cached: dict | None) -> bytes:
+            core._state = state
+            core._last_status = cached
+            w = _FakeWriter()
+            await core._write_synthetic_status(w)
+            return bytes(w.buf)
+
+        # EXECUTING + machine Idle → surfaces the lock as Idle.
+        out = await synth(
+            ProxyState.EXECUTING,
+            {"state": "Idle", "mpos": (1.0, 2.0, 0.0), "fs": (0, 0)},
+        )
+        assert out.startswith(b"<Idle|")
+        assert b"MPos:1.000,2.000,0.000" in out
+
+        # EXECUTING + machine Run → Run.
+        out = await synth(
+            ProxyState.EXECUTING,
+            {"state": "Run", "mpos": (3.0, 4.0, 0.0), "fs": (6000, 400)},
+        )
+        assert out.startswith(b"<Run|")
+
+        # EXECUTING with no cached status yet → defaults to Run.
+        out = await synth(ProxyState.EXECUTING, None)
+        assert out.startswith(b"<Run|")
+
+        # BUFFERING must keep the Run illusion even though the machine is Idle.
+        out = await synth(
+            ProxyState.BUFFERING,
+            {"state": "Idle", "mpos": (0.0, 0.0, 0.0), "fs": (0, 0)},
+        )
+        assert out.startswith(b"<Run|")
+
+        # PAUSED always reports Hold.
+        out = await synth(
+            ProxyState.PAUSED,
+            {"state": "Run", "mpos": (0.0, 0.0, 0.0), "fs": (0, 0)},
+        )
+        assert out.startswith(b"<Hold|")
 
     async def test_commands_rejected_during_executing(self, tmp_path):
         """Interactive G-code commands during EXECUTING return error:9."""
