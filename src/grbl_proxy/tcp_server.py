@@ -358,13 +358,18 @@ class TcpServer:
 
             serial_was_connected = True  # successful read confirms serial is live
 
-            # Snoop on status reports: log and cache for synthetic responses
+            # Snoop on status reports: log and cache for synthetic responses.
+            # Cache the FULL report (with Bf) for the dashboard, then strip the
+            # firmware-specific Bf field before forwarding to LightBurn — its
+            # out-of-range values (Bf:127,65535) can jam a strict host parser's
+            # buffer-fill accounting ("BUSY 100%"). Stock GRBL omits Bf by default.
             if grbl_protocol.is_status_report(line):
                 status = grbl_protocol.parse_status_report(line)
                 if status:
                     logger.debug("Machine status: %s", status)
                     if self._proxy is not None:
                         self._proxy.update_last_status(status)
+                line = grbl_protocol.strip_status_field(line, "Bf")
 
             # Re-terminate with CR+LF to match a real GRBL device — read_line()
             # stripped whatever the firmware used. A bare "\n" here can leave a

@@ -55,6 +55,32 @@ def is_status_report(line: str) -> bool:
     return s.startswith("<") and s.endswith(">")
 
 
+# Matches a single "|Key:value" segment inside a status report, e.g. "|Bf:127,65535".
+_STATUS_FIELD_SEGMENT_RE = re.compile(r"\|([A-Za-z]+):[^|>]*")
+
+
+def strip_status_field(line: str, key: str) -> str:
+    """Remove a single |Key:value segment from a GRBL status report.
+
+    Used to drop optional fields that carry firmware-specific out-of-range
+    values a stricter host parser may choke on (e.g. the Falcon 2 Pro reports
+    Bf:127,65535 — a 128-block planner and an unbounded 0xFFFF RX buffer —
+    where stock GRBL default omits Bf entirely). Leaves the line untouched if
+    the field is absent or the line is not a status report.
+
+    Example: strip_status_field("<Idle|MPos:0,0,0|Bf:127,65535|FS:0,0>", "Bf")
+             -> "<Idle|MPos:0,0,0|FS:0,0>"
+    """
+    if not is_status_report(line):
+        return line
+    key_lower = key.lower()
+
+    def _drop(m: re.Match[str]) -> str:
+        return "" if m.group(1).lower() == key_lower else m.group(0)
+
+    return _STATUS_FIELD_SEGMENT_RE.sub(_drop, line)
+
+
 def parse_status_report(line: str) -> StatusReport | None:
     """Parse a GRBL 1.1 status report string into a dict.
 
