@@ -378,7 +378,14 @@ class TcpServer:
                     continue
 
             if not line:
-                # Timeout tick from read_line — no data, keep looping
+                # Timeout tick from read_line — no data within READLINE_TIMEOUT.
+                # Log it so a freeze can be diagnosed: a steady stream of these
+                # during a lockup proves the read loop is alive and GRBL has gone
+                # silent (nothing to forward); their ABSENCE proves the read loop
+                # itself is stuck (e.g. blocked in writer.drain() on TCP
+                # backpressure) — a proxy fault, not a silent GRBL.
+                logger.debug("Serial read idle tick (no data, state=%s)",
+                             self._proxy.state.value if self._proxy else "n/a")
                 serial_was_connected = True  # read succeeded, serial is live
                 continue
 

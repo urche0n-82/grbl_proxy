@@ -36,7 +36,10 @@ def _setup_logging(debug: bool = False) -> None:
     level = logging.DEBUG if debug else logging.INFO
     logging.basicConfig(
         level=level,
-        format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        # Millisecond resolution: at 1-second resolution you can't tell whether
+        # oks are lagging the writes, batched, or absent — which is exactly what
+        # we need to see when diagnosing a passthrough stall.
+        format="%(asctime)s.%(msecs)03d %(levelname)-8s %(name)s: %(message)s",
         datefmt="%Y-%m-%dT%H:%M:%S",
         stream=sys.stdout,
     )
