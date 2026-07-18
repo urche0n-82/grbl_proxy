@@ -142,6 +142,15 @@ class ProxyCore:
         self._serial_yield = asyncio.Event()  # one-shot: tells _serial_to_tcp to stop reading
         # Phase 5: idle poll task (sends ? to GRBL when no TCP client is connected)
         self._idle_poll_task: asyncio.Task | None = None
+        # Idle-poll read handshake (A1): the poll reads serial while DISCONNECTED.
+        # Before the TCP relay starts reading (client connect), it must stop the
+        # poll and wait for any in-flight poll read to finish — otherwise two
+        # readline() threads race, and the poll can steal the client's first
+        # command response. _idle_read_idle is set when the poll is NOT reading;
+        # _idle_poll_suspended is set to keep the poll from starting new reads.
+        self._idle_read_idle = asyncio.Event()
+        self._idle_read_idle.set()
+        self._idle_poll_suspended = asyncio.Event()
         # True whenever a LightBurn TCP client is currently connected
         self._has_tcp_client: bool = False
         # Set by an explicit user cancel (web UI) so _on_streamer_done can
@@ -176,6 +185,10 @@ class ProxyCore:
     async def on_client_disconnected(self) -> None:
         """Call when the LightBurn TCP connection drops. Idempotent."""
         self._has_tcp_client = False
+        # Client is gone — let the idle poll resume reading serial. (While a job
+        # keeps running after disconnect, state stays EXECUTING so the poll
+        # stays off anyway until _on_streamer_done returns to DISCONNECTED.)
+        self._idle_poll_suspended.clear()
         if self._state == ProxyState.DISCONNECTED:
             return  # already handled (double-call guard)
         if self._state == ProxyState.BUFFERING and self._buffer is not None:
@@ -534,6 +547,18 @@ class ProxyCore:
             self._idle_poll_task = None
             logger.info("Idle GRBL poll stopped")
 
+    async def suspend_idle_poll(self) -> None:
+        """Stop the idle poll from reading serial and wait for any in-flight
+        read to finish. Called by TcpServer before it starts the relay on a
+        client connect, so the poll can't race the relay's reader or steal the
+        client's first command response. Idempotent; safe if no poll is running.
+        """
+        self._idle_poll_suspended.set()
+        try:
+            await asyncio.wait_for(self._idle_read_idle.wait(), timeout=1.5)
+        except asyncio.TimeoutError:
+            logger.warning("Idle poll did not release serial read within 1.5s")
+
     async def _idle_poll_loop(self, serial_conn: "SerialConnection", poll_hz: float) -> None:
         interval = 1.0 / max(poll_hz, 0.1)
         while True:
@@ -544,6 +569,10 @@ class ProxyCore:
                 # unsolicited '?' queries onto the wire that LightBurn never
                 # asked for, interleaved with its own command/response traffic.
                 if self._state is not ProxyState.DISCONNECTED:
+                    continue
+                # A client is connecting and the relay is about to take over the
+                # read path — do not start a poll read that would race it.
+                if self._idle_poll_suspended.is_set():
                     continue
                 if not serial_conn.is_connected:
                     continue
@@ -570,11 +599,19 @@ class ProxyCore:
         stop the underlying thread, leaving a dangling reader that races with the next
         call and produces split/interleaved lines.
         """
-        while self._state == ProxyState.DISCONNECTED:
+        while (
+            self._state == ProxyState.DISCONNECTED
+            and not self._idle_poll_suspended.is_set()
+        ):
+            # Mark that a poll read is in flight so suspend_idle_poll() waits for
+            # it to finish before the relay starts reading.
+            self._idle_read_idle.clear()
             try:
                 line = await serial_conn.read_line()
             except Exception:
                 break
+            finally:
+                self._idle_read_idle.set()
             if not line:
                 # Empty string = serial readline timeout, port is quiet
                 break

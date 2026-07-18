@@ -108,6 +108,10 @@ class TcpServer:
         self._line_buf.clear()
 
         if self._proxy is not None:
+            # Stop the idle poll and wait for any in-flight poll read to finish
+            # BEFORE the relay starts reading, so the two never race on the fd
+            # and the poll can't swallow this client's first command response.
+            await self._proxy.suspend_idle_poll()
             self._proxy.on_client_connected()
 
         # Shared event: set by either relay task to signal the other to stop.
@@ -299,11 +303,13 @@ class TcpServer:
                 stop_task.cancel()
                 if yield_task is not None:
                     yield_task.cancel()
-                # Only close serial if we own the read path. During
-                # EXECUTING/PAUSED the streamer owns it — closing here
-                # would kill the actively streaming job.
-                if self._proxy is None or self._proxy.serial_readable.is_set():
-                    self._serial.close_immediately()
+                # Do NOT close the serial port here. A client disconnect (or a
+                # client swap that cancels this task) must leave the USB link
+                # open — closing it forces a reconnect-loop re-open (up to
+                # reconnect_interval) that bounces a fast LightBurn reconnect.
+                # read_task.cancel() lets read_line() drain its worker thread
+                # under _read_lock, so no orphaned readline overlaps the next
+                # reader. The port is closed only by disconnect() on shutdown.
                 raise
             finally:
                 stop_task.cancel()
@@ -340,11 +346,12 @@ class TcpServer:
             if stop_relay.is_set():
                 logger.debug("_serial_to_tcp: stop_relay set, exiting")
                 read_task.cancel()
-                # Close the port immediately so the readline thread unblocks
-                # — but only if we own the read path. During EXECUTING/PAUSED
-                # the streamer owns serial; closing it would kill the job.
-                if self._proxy is None or self._proxy.serial_readable.is_set():
-                    self._serial.close_immediately()
+                # Do NOT close the port on a normal client disconnect — keep the
+                # serial link up so an immediate LightBurn reconnect isn't
+                # bounced by the reconnect loop. read_task.cancel() drains the
+                # in-flight readline thread under _read_lock (no overlap with the
+                # next reader). The port is closed only by disconnect() (shutdown)
+                # or by read_line() itself on a real serial error.
                 break
 
             # Signal idle now that the read has completed

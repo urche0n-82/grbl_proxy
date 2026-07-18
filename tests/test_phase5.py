@@ -254,6 +254,81 @@ async def test_idle_poll_skips_when_disconnected_serial(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# A1 — idle-poll suspend handshake (stops the poll racing the relay's reader
+# and stealing the client's first command response on connect).
+# ---------------------------------------------------------------------------
+
+
+async def test_suspend_idle_poll_stops_polling(tmp_path):
+    """After suspend_idle_poll(), the poll sends no more '?'."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+    serial = _make_serial(connected=True)
+    serial.read_line = AsyncMock(return_value="")  # quiet port
+
+    core.start_idle_poll(serial, poll_hz=20.0)
+    await asyncio.sleep(0.15)
+    assert serial.write.await_count >= 1  # polling was happening
+
+    await core.suspend_idle_poll()
+    count_after_suspend = serial.write.await_count
+    await asyncio.sleep(0.15)
+    core.stop_idle_poll()
+
+    assert serial.write.await_count == count_after_suspend  # no new polls
+
+
+async def test_suspend_idle_poll_waits_for_inflight_read(tmp_path):
+    """suspend_idle_poll() must not return until an in-flight poll read ends —
+    that's what guarantees the relay never overlaps the poll's readline()."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+
+    release = asyncio.Event()
+    reading = asyncio.Event()
+
+    async def slow_read():
+        reading.set()
+        await release.wait()
+        return ""
+
+    serial = _make_serial(connected=True)
+    serial.read_line = AsyncMock(side_effect=slow_read)
+
+    core.start_idle_poll(serial, poll_hz=50.0)
+    await asyncio.wait_for(reading.wait(), timeout=1.0)  # poll is mid-read
+
+    suspend_task = asyncio.create_task(core.suspend_idle_poll())
+    await asyncio.sleep(0.1)
+    assert not suspend_task.done()  # still blocked on the in-flight read
+
+    release.set()
+    await asyncio.wait_for(suspend_task, timeout=2.0)  # now completes
+    core.stop_idle_poll()
+
+
+async def test_disconnect_resumes_idle_poll(tmp_path):
+    """A client disconnect clears the suspend so idle polling resumes."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+    serial = _make_serial(connected=True)
+    serial.read_line = AsyncMock(return_value="")
+
+    core.start_idle_poll(serial, poll_hz=20.0)
+    await core.suspend_idle_poll()
+    core._state = ProxyState.PASSTHROUGH  # a client was connected
+    await asyncio.sleep(0.1)
+
+    await core.on_client_disconnected()  # → DISCONNECTED, clears suspend
+    assert not core._idle_poll_suspended.is_set()
+
+    before = serial.write.await_count
+    await asyncio.sleep(0.15)
+    core.stop_idle_poll()
+    assert serial.write.await_count > before  # polling resumed
+
+
+# ---------------------------------------------------------------------------
 # Feature B — POST /api/job and POST /api/job/start
 # ---------------------------------------------------------------------------
 
