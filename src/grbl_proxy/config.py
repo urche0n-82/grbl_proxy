@@ -22,6 +22,13 @@ class SerialConfig:
     baud: int = 115200
     dtr: bool = False
     reconnect_interval: float = 5.0
+    # Soft-reset GRBL (Ctrl-X) when a fresh LightBurn client connects, giving it
+    # a clean runtime state — the same clean slate a direct serial connection
+    # gets from its DTR reset on open. Without this, GRBL keeps whatever stale
+    # in-RAM state it was left in (the proxy deliberately does NOT toggle DTR),
+    # which can hang the first job of a session. Only fires on a fresh connect,
+    # never on a mid-job reconnect.
+    reset_on_connect: bool = True
 
 
 @dataclass

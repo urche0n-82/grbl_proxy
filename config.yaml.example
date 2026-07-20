@@ -6,6 +6,11 @@ serial:
   baud: 115200
   dtr: false              # CRITICAL: false prevents ESP32-S2 reset on connect
   reconnect_interval: 5   # seconds between reconnection attempts
+  reset_on_connect: true  # soft-reset GRBL (Ctrl-X) when LightBurn connects, so
+                          # each session starts from a clean state — the same
+                          # clean slate a direct serial link gets from its DTR
+                          # reset. Fixes first-job-after-connect hangs. Only
+                          # fires on a fresh connect, never a mid-job reconnect.
 
 tcp:
   host: 0.0.0.0

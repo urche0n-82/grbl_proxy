@@ -71,6 +71,9 @@ class MockSerialConnection:
                     self._rx_queue.put_nowait(
                         grbl_protocol.make_status_response().rstrip("\r\n")
                     )
+                elif b == 0x18:
+                    # Ctrl-X soft reset → GRBL reboots and prints its banner.
+                    self._rx_queue.put_nowait("Grbl 1.1f ['$' for help]")
             else:
                 remaining.append(b)
 

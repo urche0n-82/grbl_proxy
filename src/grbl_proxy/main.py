@@ -75,7 +75,13 @@ async def _main(config_path: Path | None = None, debug: bool = False, stop_event
     )
 
     proxy_core = ProxyCore(config.job)
-    tcp_server = TcpServer(config.tcp.host, config.tcp.port, serial_conn, proxy_core=proxy_core)
+    tcp_server = TcpServer(
+        config.tcp.host,
+        config.tcp.port,
+        serial_conn,
+        proxy_core=proxy_core,
+        reset_on_connect=config.serial.reset_on_connect,
+    )
     try:
         server = await tcp_server.start()
     except OSError as e:

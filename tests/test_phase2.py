@@ -66,6 +66,75 @@ async def _enter_buffering(
     await asyncio.wait_for(reader.readline(), timeout=2.0)
 
 
+class TestResetOnConnect:
+    """A fresh LightBurn connect soft-resets GRBL (Ctrl-X) so the session starts
+    clean — matching a direct serial connection's DTR reset. Never on a mid-job
+    reconnect."""
+
+    async def test_fresh_connect_sends_ctrl_x_and_forwards_banner(self, tmp_path):
+        mock = MockSerialConnection(auto_respond=True)
+        core = ProxyCore(_make_job_cfg(tmp_path / "jobs"), idle_timeout_s=0.1)
+        server = TcpServer(
+            "127.0.0.1", _BASE_PORT + 30, mock, proxy_core=core,
+            reset_on_connect=True,
+        )
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 30)
+            # First thing the client sees is GRBL's reboot banner.
+            banner = await asyncio.wait_for(reader.readline(), timeout=2.0)
+            assert banner.startswith(b"Grbl ")
+            assert banner.endswith(b"\r\n")
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+        # The soft reset was the first byte written to GRBL.
+        assert b"\x18" in b"".join(mock.tx_log)
+
+    async def test_no_reset_when_flag_disabled(self, tmp_path):
+        mock = MockSerialConnection(auto_respond=True)
+        core = ProxyCore(_make_job_cfg(tmp_path / "jobs"), idle_timeout_s=0.1)
+        server = TcpServer(
+            "127.0.0.1", _BASE_PORT + 31, mock, proxy_core=core,
+            reset_on_connect=False,
+        )
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 31)
+            await asyncio.sleep(0.1)
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+        assert b"\x18" not in b"".join(mock.tx_log)
+
+    async def test_no_reset_on_midjob_reconnect(self, tmp_path):
+        """A reconnect while a job is EXECUTING must NOT reset GRBL — that would
+        abort the running job. on_client_connected keeps EXECUTING, so the reset
+        gate (state == PASSTHROUGH) is skipped."""
+        mock = MockSerialConnection(auto_respond=True)
+        core = ProxyCore(_make_job_cfg(tmp_path / "jobs"), idle_timeout_s=0.1)
+        core._state = ProxyState.EXECUTING
+        server = TcpServer(
+            "127.0.0.1", _BASE_PORT + 32, mock, proxy_core=core,
+            reset_on_connect=True,
+        )
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 32)
+            await asyncio.sleep(0.1)
+            assert core.state == ProxyState.EXECUTING  # job untouched
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+        assert b"\x18" not in b"".join(mock.tx_log)
+
+
 # ---------------------------------------------------------------------------
 # TestJobBuffer
 # ---------------------------------------------------------------------------

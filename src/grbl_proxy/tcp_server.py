@@ -20,6 +20,9 @@ from grbl_proxy.serial_conn import SerialDisconnectedError
 
 logger = logging.getLogger(__name__)
 
+# Max seconds to wait for GRBL's reboot banner after a soft-reset-on-connect.
+RESET_BANNER_TIMEOUT = 3.0
+
 # Avoid a circular import: proxy_core imports grbl_protocol but not tcp_server.
 # Import ProxyCore lazily via TYPE_CHECKING so it's available for type hints
 # but not loaded at module import time.
@@ -31,7 +34,14 @@ if TYPE_CHECKING:
 class TcpServer:
     """Manages a single LightBurn TCP connection and the bidirectional relay."""
 
-    def __init__(self, host: str, port: int, serial_conn, proxy_core: "ProxyCore | None" = None) -> None:
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        serial_conn,
+        proxy_core: "ProxyCore | None" = None,
+        reset_on_connect: bool = False,
+    ) -> None:
         """
         Args:
             host: Bind address (e.g. "0.0.0.0").
@@ -41,11 +51,15 @@ class TcpServer:
                          MockSerialConnection for testing.
             proxy_core: Optional Phase 2+ state machine. When None (default),
                         the server behaves as a pure Phase 1 passthrough relay.
+            reset_on_connect: When True, soft-reset GRBL (Ctrl-X) on a fresh
+                        client connect so each session starts clean. Defaults to
+                        False here; main.py wires it from serial.reset_on_connect.
         """
         self._host = host
         self._port = port
         self._serial = serial_conn
         self._proxy = proxy_core
+        self._reset_on_connect = reset_on_connect
         self._current_writer: asyncio.StreamWriter | None = None
         self._relay_tasks: list[asyncio.Task] = []
         self._server: asyncio.Server | None = None
@@ -114,6 +128,15 @@ class TcpServer:
             await self._proxy.suspend_idle_poll()
             self._proxy.on_client_connected()
 
+            # Fresh session (Disconnected→Passthrough, not a mid-job reconnect):
+            # soft-reset GRBL so it starts clean, matching a direct connection's
+            # DTR reset. Done before the relay starts so the reboot doesn't race
+            # LightBurn's connect commands (they wait in the TCP buffer). A
+            # mid-job reconnect keeps EXECUTING/PAUSED/ERROR and is NOT reset.
+            from grbl_proxy.proxy_core import ProxyState
+            if self._reset_on_connect and self._proxy.state == ProxyState.PASSTHROUGH:
+                await self._reset_grbl_on_connect(writer)
+
         # Shared event: set by either relay task to signal the other to stop.
         # This avoids FIRST_COMPLETED (which kills the connection on any transient
         # serial error) while still ensuring _serial_to_tcp exits promptly when
@@ -152,6 +175,51 @@ class TcpServer:
             self._current_writer = None
             self._relay_tasks = []
         self._line_buf.clear()
+
+    async def _reset_grbl_on_connect(self, writer: asyncio.StreamWriter) -> None:
+        """Soft-reset GRBL (Ctrl-X) on a fresh connect for a clean session state.
+
+        A direct serial connection resets the board via DTR on open; the proxy
+        keeps DTR disabled, so without this GRBL carries stale in-RAM state into
+        the first job (which can hang it). We send the reset and wait for GRBL's
+        reboot banner before returning, so LightBurn's connect commands (queued
+        in the TCP buffer meanwhile) don't race the reboot. Boot lines are
+        forwarded to LightBurn, which expects a GRBL welcome on connect.
+
+        Called while the relay is NOT yet running and the idle poll is suspended,
+        so this is the only reader — safe to read serial directly.
+        """
+        if not self._serial.is_connected:
+            logger.debug("reset_on_connect: serial not connected — skipping")
+            return
+        try:
+            await self._serial.write(b"\x18")
+        except Exception as e:
+            logger.warning("reset_on_connect: could not send soft reset: %s", e)
+            return
+        logger.info("reset_on_connect: soft reset sent, awaiting GRBL banner")
+
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + RESET_BANNER_TIMEOUT
+        while loop.time() < deadline:
+            try:
+                line = await self._serial.read_line()
+            except SerialDisconnectedError:
+                break
+            if not line:
+                continue  # readline timeout tick — keep waiting for the banner
+            try:
+                writer.write((line + grbl_protocol.LINE_TERMINATOR).encode())
+                await writer.drain()
+            except (BrokenPipeError, ConnectionResetError):
+                break
+            if grbl_protocol.is_grbl_greeting(line):
+                logger.info("reset_on_connect: GRBL banner received — session clean")
+                return
+        logger.warning(
+            "reset_on_connect: no GRBL banner within %.1fs — proceeding anyway",
+            RESET_BANNER_TIMEOUT,
+        )
 
     async def _drop_current_client(self, reason: str) -> None:
         """Cancel relay tasks and close the current writer."""
