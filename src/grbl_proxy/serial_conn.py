@@ -13,13 +13,27 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import time
 
 import serial
 import serial.tools.list_ports
 
-from grbl_proxy.config import SerialConfig
+from grbl_proxy.config import SerialConfig, list_serial_candidates
 
 logger = logging.getLogger(__name__)
+
+# How often the reconnect loop wakes to check on the device. Deliberately
+# shorter than reconnect_interval: noticing that a node has vanished is urgent
+# (we must drop the fd — see run_reconnect_loop), whereas retrying an open is
+# not. Open attempts stay throttled to reconnect_interval.
+PORT_MONITOR_INTERVAL = 1.0
+
+# How long a device node must exist before we try to open it. A node appears the
+# moment the controller enumerates, but this firmware then boots for several
+# seconds and re-initialises its USB endpoint partway through. Opening into that
+# window yields "device reports readiness to read but returned no data" and, far
+# worse, pins the minor number so the board returns as ttyACM1.
+PORT_SETTLE_SECONDS = 2.0
 
 READLINE_TIMEOUT = 1.0  # seconds — allows reconnection detection loop to tick
 
@@ -39,6 +53,13 @@ class SerialConnection:
     def __init__(self, config: SerialConfig, port: str | None = None):
         self._config = config
         self._port = port or config.port
+        # With serial.port == "auto" the device path must stay re-resolvable:
+        # the controller can come back on a different index after a power cycle,
+        # and a path resolved once at startup would strand the proxy forever.
+        self._auto_detect = config.port == "auto"
+        # When the current device node was first seen present (monotonic), used
+        # to let it settle before opening. None = not currently present.
+        self._port_first_seen: float | None = None
         self._serial: serial.Serial | None = None
         self._write_lock = asyncio.Lock()
         # Serializes reads: at most one readline() worker thread may touch the
@@ -188,32 +209,89 @@ class SerialConnection:
         only called when the port file is present, keeping the blocking window
         short and ensuring task cancellation (SIGINT/SIGTERM) is not delayed by
         a hung open() on a disconnected USB device.
-        """
-        while not self._shutting_down:
-            if not self._connected.is_set():
-                # Only attempt open if the device file exists — avoids a long
-                # blocking serial.Serial() call on a missing/disconnected port.
-                if os.path.exists(self._port):
-                    logger.info(
-                        "Attempting serial reconnect to %s ...", self._port
-                    )
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.to_thread(self._open_port),
-                            timeout=self._config.reconnect_interval - 0.5,
-                        )
-                        self._connected.set()
-                        logger.info("Serial reconnected to %s", self._port)
-                    except SerialDisconnectedError:
-                        pass  # will retry after interval
-                    except asyncio.TimeoutError:
-                        logger.debug("Serial open timed out, will retry")
-                else:
-                    logger.debug(
-                        "Waiting for %s to appear ...", self._port
-                    )
 
-            await asyncio.sleep(self._config.reconnect_interval)
+        The loop ticks at PORT_MONITOR_INTERVAL but only *opens* every
+        config.reconnect_interval. The fast tick exists to drop the fd promptly
+        when a device node vanishes; the slow retry avoids hammering open().
+        """
+        next_attempt = 0.0
+        while not self._shutting_down:
+            now = time.monotonic()
+
+            # Release the fd as soon as the node goes away, without waiting for
+            # a read/write to fail. Holding an fd on a departed USB CDC device
+            # keeps its minor number allocated, so the controller re-enumerates
+            # as ttyACM1 rather than reclaiming ttyACM0 — and an auto-detect
+            # path pinned at boot would then never find it again.
+            if self._connected.is_set() and not os.path.exists(self._port):
+                logger.warning(
+                    "Serial device %s disappeared — closing port so its "
+                    "kernel node can be released",
+                    self._port,
+                )
+                self.close_immediately()
+
+            if not self._connected.is_set():
+                self._rescan_port()
+
+                if not os.path.exists(self._port):
+                    self._port_first_seen = None
+                    logger.debug("Waiting for %s to appear ...", self._port)
+                else:
+                    # Let a freshly-appeared node settle before opening it: the
+                    # controller boots for several seconds after enumerating and
+                    # re-initialises its USB endpoint partway through.
+                    if self._port_first_seen is None:
+                        self._port_first_seen = now
+                        logger.debug(
+                            "Serial node %s appeared — settling for %.1fs",
+                            self._port, PORT_SETTLE_SECONDS,
+                        )
+                    elif (
+                        now - self._port_first_seen >= PORT_SETTLE_SECONDS
+                        and now >= next_attempt
+                    ):
+                        next_attempt = now + self._config.reconnect_interval
+                        logger.info(
+                            "Attempting serial reconnect to %s ...", self._port
+                        )
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.to_thread(self._open_port),
+                                timeout=max(
+                                    1.0, self._config.reconnect_interval - 0.5
+                                ),
+                            )
+                            self._connected.set()
+                            logger.info("Serial reconnected to %s", self._port)
+                        except SerialDisconnectedError:
+                            pass  # will retry after the interval
+                        except asyncio.TimeoutError:
+                            logger.debug("Serial open timed out, will retry")
+
+            await asyncio.sleep(PORT_MONITOR_INTERVAL)
+
+    def _rescan_port(self) -> None:
+        """Re-resolve the device path when serial.port is 'auto'.
+
+        Without this the path picked at startup is retried forever, so a
+        controller that came back on a different index (ttyACM0 → ttyACM1 after
+        a power cycle) is never found again. Candidates are newest-first, which
+        also steps over a stale node left behind by the previous connection.
+        """
+        if not self._auto_detect:
+            return
+        candidates = list_serial_candidates()
+        if not candidates:
+            return  # keep the current path and keep waiting for it
+        newest = candidates[0]
+        if newest != self._port:
+            logger.info(
+                "Serial device moved: %s → %s (candidates: %s)",
+                self._port, newest, candidates,
+            )
+            self._port = newest
+            self._port_first_seen = None  # settle timer applies to the new node
 
     @property
     def is_connected(self) -> bool:

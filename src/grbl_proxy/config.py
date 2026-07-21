@@ -144,6 +144,25 @@ def load_config(path: Path | None = None) -> Config:
     return _dict_to_config(user_data)
 
 
+def list_serial_candidates() -> list[str]:
+    """Candidate controller device nodes, most recently created first.
+
+    Ordering by mtime matters for recovery, not just tidiness: when a USB
+    controller re-enumerates it is given a NEW node (ttyACM1) while the old one
+    (ttyACM0) can linger as a dead entry until every fd on it is closed. Picking
+    the freshest node follows the live device instead of retrying the corpse.
+    """
+    paths = glob.glob("/dev/ttyUSB*") + glob.glob("/dev/ttyACM*")
+
+    def _created(path: str) -> float:
+        try:
+            return os.stat(path).st_mtime
+        except OSError:
+            return 0.0
+
+    return sorted(paths, key=_created, reverse=True)
+
+
 def resolve_serial_port(config: SerialConfig) -> str:
     """Resolve 'auto' serial port to an actual device path."""
     if config.port != "auto":

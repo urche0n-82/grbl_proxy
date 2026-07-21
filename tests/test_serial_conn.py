@@ -73,6 +73,77 @@ def _make_conn(fake) -> SerialConnection:
     return conn
 
 
+class TestPortRecovery:
+    """A USB controller that re-enumerates gets a NEW node (ttyACM1) while the
+    old one can linger until every fd on it is closed. The proxy has to follow
+    it, and must not be the thing pinning the old node."""
+
+    def _auto_conn(self) -> SerialConnection:
+        return SerialConnection(SerialConfig(port="auto"), port="/dev/ttyACM0")
+
+    def test_rescan_follows_device_to_a_new_node(self, monkeypatch):
+        conn = self._auto_conn()
+        # Controller came back as ttyACM1; ttyACM0 lingers as a dead node.
+        monkeypatch.setattr(
+            "grbl_proxy.serial_conn.list_serial_candidates",
+            lambda: ["/dev/ttyACM1", "/dev/ttyACM0"],  # newest first
+        )
+        conn._rescan_port()
+        assert conn.port == "/dev/ttyACM1"
+
+    def test_rescan_resets_the_settle_timer_for_the_new_node(self, monkeypatch):
+        conn = self._auto_conn()
+        conn._port_first_seen = 123.0  # settling on the OLD node
+        monkeypatch.setattr(
+            "grbl_proxy.serial_conn.list_serial_candidates",
+            lambda: ["/dev/ttyACM1"],
+        )
+        conn._rescan_port()
+        assert conn._port_first_seen is None
+
+    def test_rescan_keeps_current_path_when_nothing_present(self, monkeypatch):
+        """No candidates yet (laser powered off) — keep waiting on the current
+        path rather than clearing it or inventing a fallback."""
+        conn = self._auto_conn()
+        monkeypatch.setattr(
+            "grbl_proxy.serial_conn.list_serial_candidates", lambda: []
+        )
+        conn._rescan_port()
+        assert conn.port == "/dev/ttyACM0"
+
+    def test_explicit_port_is_never_rescanned(self, monkeypatch):
+        """An operator-pinned path (or a udev symlink) must be honoured."""
+        conn = SerialConnection(
+            SerialConfig(port="/dev/grbl-laser"), port="/dev/grbl-laser"
+        )
+        monkeypatch.setattr(
+            "grbl_proxy.serial_conn.list_serial_candidates",
+            lambda: ["/dev/ttyACM1"],
+        )
+        conn._rescan_port()
+        assert conn.port == "/dev/grbl-laser"
+
+    async def test_vanished_node_closes_the_port_promptly(self, monkeypatch):
+        """The fd must be dropped when the node disappears — holding it is what
+        forces the controller to re-enumerate under a new index."""
+        conn = self._auto_conn()
+        conn._serial = _ScriptedSerial([])   # pretend open
+        conn._connected.set()
+        monkeypatch.setattr("grbl_proxy.serial_conn.os.path.exists", lambda p: False)
+        monkeypatch.setattr(
+            "grbl_proxy.serial_conn.list_serial_candidates", lambda: []
+        )
+
+        task = asyncio.create_task(conn.run_reconnect_loop())
+        await asyncio.sleep(1.3)  # one monitor tick
+        conn.signal_shutdown()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert not conn.is_connected
+        assert conn._serial is None  # fd released, node free to be reclaimed
+
+
 class TestLineFraming:
     """read_line() must only ever emit complete, newline-terminated lines. A
     read landing mid-line has to buffer the fragment, not hand it back as a
