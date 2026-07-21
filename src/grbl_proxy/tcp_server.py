@@ -447,13 +447,11 @@ class TcpServer:
 
             if not line:
                 # Timeout tick from read_line — no data within READLINE_TIMEOUT.
-                # Log it so a freeze can be diagnosed: a steady stream of these
-                # during a lockup proves the read loop is alive and GRBL has gone
-                # silent (nothing to forward); their ABSENCE proves the read loop
-                # itself is stuck (e.g. blocked in writer.drain() on TCP
-                # backpressure) — a proxy fault, not a silent GRBL.
-                logger.debug("Serial read idle tick (no data, state=%s)",
-                             self._proxy.state.value if self._proxy else "n/a")
+                # Not logged: an idle machine produces one of these every second,
+                # which drowns the debug log. (This tick was temporarily logged
+                # to prove the read loop stayed alive during a passthrough
+                # freeze; that turned out to be a firmware write-interleave,
+                # fixed in grbl_protocol.split_responses.)
                 serial_was_connected = True  # read succeeded, serial is live
                 continue
 
