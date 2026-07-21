@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,13 @@ class GrblStreamer:
         self._cancelled = False
         self._lines_sent = 0
         self._total_lines = 0
+        # Inline polling state (single serial owner — see _maybe_poll).
+        self._last_poll = 0.0
+        # Largest RX-free figure GRBL has reported, i.e. its true buffer
+        # capacity (observed when idle). Used to convert a reported rx_free into
+        # "bytes actually outstanding" so a drifted local counter can be
+        # corrected against the machine's own view.
+        self._rx_capacity = 0
 
     # ------------------------------------------------------------------
     # Public interface
@@ -93,10 +101,10 @@ class GrblStreamer:
                 self._total_lines,
                 self._path,
             )
-            poll_task = asyncio.create_task(self._poll_loop(), name="streamer-poll")
+            # No separate poll task: _stream_lines emits '?' inline so exactly
+            # one coroutine owns the serial port. A concurrent poller makes the
+            # request/response ordering nondeterministic and untestable.
             result = await self._stream_lines(lines)
-            poll_task.cancel()
-            await asyncio.gather(poll_task, return_exceptions=True)
         except asyncio.CancelledError:
             result = StreamerResult(
                 completed=False,
@@ -175,10 +183,14 @@ class GrblStreamer:
         """
         buffer_used = 0
         line_lengths: deque[int] = deque()
+        # Messages already parsed out of a serial line but not yet consumed —
+        # one line can carry several when the firmware interleaves writes.
+        pending: deque[str] = deque()
 
         for i, line in enumerate(lines):
             # Respect pause (feed hold from LightBurn or web dashboard)
             await self._resume_event.wait()
+            await self._maybe_poll()
 
             if self._cancelled:
                 return StreamerResult(
@@ -215,7 +227,8 @@ class GrblStreamer:
                         lines_sent=self._lines_sent,
                         total_lines=len(lines),
                     )
-                response = await self._serial.read_line()
+                await self._maybe_poll()
+                response = await self._next_response(pending)
                 if not response:
                     continue  # serial timeout tick, keep waiting
                 if grbl_protocol.is_ok(response):
@@ -264,6 +277,9 @@ class GrblStreamer:
                     if status:
                         if self._on_status:
                             self._on_status(status)
+                        # Trust the machine's own buffer report over our locally
+                        # accumulated count, which can only drift upward.
+                        buffer_used = self._reconcile_buffer(status, buffer_used)
                         # Sustained Idle while we're still waiting for buffer
                         # room is a contradiction: an idle GRBL has an empty
                         # planner and a drained RX, so it owes us nothing and
@@ -348,7 +364,8 @@ class GrblStreamer:
                     lines_sent=self._lines_sent,
                     total_lines=len(lines),
                 )
-            response = await self._serial.read_line()
+            await self._maybe_poll()
+            response = await self._next_response(pending)
             if not response:
                 continue
             if grbl_protocol.is_ok(response):
@@ -423,19 +440,66 @@ class GrblStreamer:
             total_lines=len(lines),
         )
 
-    async def _poll_loop(self) -> None:
-        """Periodically send '?' to GRBL to get position and machine state.
+    async def _maybe_poll(self) -> None:
+        """Emit a '?' status query if the poll interval has elapsed.
 
-        The responses (status reports) arrive interleaved with ok responses in
-        the _stream_lines loop, which handles them via is_status_report().
+        Called from within the streaming loop rather than from a concurrent
+        task, so a single coroutine owns every byte written to the port. That
+        keeps the request/response sequence deterministic (and reproducible in
+        tests) instead of depending on how two tasks happen to interleave.
         """
+        now = time.monotonic()
+        if now - self._last_poll < self._poll_interval:
+            return
+        self._last_poll = now
         try:
-            while True:
-                await asyncio.sleep(self._poll_interval)
-                try:
-                    await self._serial.write(b"?")
-                except SerialDisconnectedError:
-                    logger.debug("Streamer poll: serial not available, stopping poll")
-                    break
-        except asyncio.CancelledError:
-            pass
+            await self._serial.write(b"?")
+        except SerialDisconnectedError:
+            logger.debug("Streamer poll: serial unavailable, skipping")
+
+    async def _next_response(self, pending: deque[str]) -> str:
+        """Return the next GRBL protocol message, or "" on an idle tick.
+
+        Reads a line only when the pending queue is empty, then splits it —
+        one serial line can carry more than one message when the firmware
+        interleaves a status report with an ack (see split_responses). Pulling
+        messages through this queue means the drain loops still see exactly one
+        message per iteration.
+        """
+        if not pending:
+            line = await self._serial.read_line()
+            if not line:
+                return ""
+            pending.extend(grbl_protocol.split_responses(line))
+            if not pending:
+                return ""
+        return pending.popleft()
+
+    def _reconcile_buffer(
+        self, status: grbl_protocol.StatusReport, buffer_used: int
+    ) -> int:
+        """Correct the local in-flight byte count against GRBL's own report.
+
+        buffer_used is accumulated locally (add on send, subtract on ack) and so
+        can only ever drift upward when an ack is lost — permanently, until the
+        window fills and streaming deadlocks. GRBL publishes the truth in
+        Bf:<planner free>,<rx free> several times a second; if it says more room
+        is available than we believe, trust the machine and resync.
+        """
+        bf = status.get("bf")
+        if not bf:
+            return buffer_used
+        rx_free = bf[1]
+        # Capacity == the most free space ever reported (i.e. when fully idle).
+        self._rx_capacity = max(self._rx_capacity, rx_free)
+        if not self._rx_capacity:
+            return buffer_used
+        implied_used = max(0, self._rx_capacity - rx_free)
+        if implied_used < buffer_used:
+            logger.debug(
+                "Streamer: resyncing in-flight %d → %d bytes from GRBL Bf "
+                "(rx_free=%d, capacity=%d)",
+                buffer_used, implied_used, rx_free, self._rx_capacity,
+            )
+            return implied_used
+        return buffer_used

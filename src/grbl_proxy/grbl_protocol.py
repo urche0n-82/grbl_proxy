@@ -46,13 +46,69 @@ class StatusReport(TypedDict, total=False):
     ov: tuple[int, int, int]
     pn: str
     a: str
-    buf: int
+    # Buffer state: (planner blocks free, serial RX bytes free). This is the
+    # machine's own authoritative view of how much room it has — use it to
+    # reconcile locally-accumulated flow-control counters, which can only drift.
+    bf: tuple[int, int]
 
 
 def is_status_report(line: str) -> bool:
     """Return True if line is a GRBL status report (<...>)."""
     s = line.strip()
     return s.startswith("<") and s.endswith(">")
+
+
+# A complete status report block, e.g. "<Idle|MPos:0,0,0|FS:0,0>".
+_STATUS_BLOCK_RE = re.compile(r"<[^<>]*>")
+# A protocol message trailing a corrupted line. Deliberately NOT anchored with a
+# leading \b: the observed corruption splices the ack straight onto a digit
+# ("WCO:0.000,0ok"), where a word boundary would fail to match.
+_TRAILING_MESSAGE_RE = re.compile(r"(ok|error:\d+|ALARM:\d+)\s*$")
+
+
+def split_responses(line: str) -> list[str]:
+    """Split one serial line into the GRBL protocol messages it contains.
+
+    Normally a line holds exactly one message and this returns [line].
+
+    Under load, ESP32 GRBL forks interleave the realtime status-report write
+    with the main loop's ok/error write, emitting a single line that holds a
+    *truncated* status plus a complete message:
+
+        '<Run|MPos:201.275,148.225,0.000|Bf:0,65459|FS:1501,3|Ov:100,100,ok'
+        '<Run|MPos:296.763,263.250,0.000|Bf:0,65475|FS:1958,3|WCO:0.000,0ok'
+
+    Requiring an exact "ok" match silently drops that ack, and a character-
+    counting sender then under-counts free buffer space for the rest of the job
+    until it deadlocks. Recovering the trailing message here is what lets the
+    stream survive the corruption — it is why LightBurn tolerates this firmware
+    and a strict parser does not. The truncated status fragment is unrecoverable
+    and is discarded.
+    """
+    s = line.strip()
+    if not s:
+        return []
+
+    # Fast path: a clean, complete single message (the overwhelming majority).
+    if is_ok(s) or is_error(s) or is_alarm(s) or is_status_report(s):
+        return [s]
+
+    # Possibly interleaved. Lift out any complete status blocks first, blanking
+    # them so their contents can't be mistaken for a trailing message.
+    messages: list[str] = []
+
+    def _lift(m: "re.Match[str]") -> str:
+        messages.append(m.group(0))
+        return " " * len(m.group(0))
+
+    remainder = _STATUS_BLOCK_RE.sub(_lift, s)
+
+    trailing = _TRAILING_MESSAGE_RE.search(remainder)
+    if trailing:
+        messages.append(trailing.group(1))
+
+    # Nothing salvageable (e.g. "[MSG:...]", banner) — hand back untouched.
+    return messages or [s]
 
 
 def parse_status_report(line: str) -> StatusReport | None:
@@ -106,11 +162,17 @@ def parse_status_report(line: str) -> StatusReport | None:
             result["pn"] = val
         elif key == "A":
             result["a"] = val
-        elif key == "BUF":
-            try:
-                result["buf"] = int(val)
-            except ValueError:
-                pass
+        elif key == "BF":
+            # "Bf:<planner blocks free>,<serial RX bytes free>". NOTE: the field
+            # is "Bf", not "Buf" — matching the wrong name silently dropped the
+            # machine's own buffer report, which is the only thing that can
+            # correct a drifted flow-control counter.
+            parts = val.split(",")
+            if len(parts) == 2:
+                try:
+                    result["bf"] = (int(parts[0]), int(parts[1]))
+                except ValueError:
+                    pass
 
     return result
 

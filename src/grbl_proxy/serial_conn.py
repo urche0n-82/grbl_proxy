@@ -47,6 +47,11 @@ class SerialConnection:
         # and (critically) not released on cancellation until the worker thread
         # has finished — see read_line().
         self._read_lock = asyncio.Lock()
+        # Holds bytes received but not yet terminated by a newline. A read that
+        # returns mid-line MUST keep the fragment here rather than emitting it
+        # as a line — otherwise a split read silently fabricates two garbage
+        # "lines" and destroys whatever message it cut in half.
+        self._rx_buf = bytearray()
         self._connected = asyncio.Event()
         self._shutting_down = False
 
@@ -82,6 +87,9 @@ class SerialConnection:
         s = self._serial
         self._serial = None
         self._connected.clear()
+        # Drop any partial line — a fragment from the closed session must never
+        # be prepended to data from the next one.
+        self._rx_buf.clear()
         if s is not None:
             try:
                 s.close()
@@ -89,48 +97,64 @@ class SerialConnection:
                 pass
 
     async def read_line(self) -> str:
-        """Read one newline-terminated line from the serial port.
+        """Return one complete newline-terminated line from the serial port.
 
-        Blocks (in a thread) until a complete line arrives or the 1-second
-        readline timeout fires. On timeout returns an empty string. On USB
-        disconnect raises SerialDisconnectedError.
+        Returns "" when no complete line is available within READLINE_TIMEOUT
+        (not an error — callers treat it as an idle tick). Raises
+        SerialDisconnectedError on USB disconnect.
 
-        Reads are serialized by _read_lock so two readline() worker threads can
-        never touch the fd at once. If this coroutine is cancelled while the
-        worker thread is still blocked in readline(), it waits for that thread
-        to finish before releasing the lock — otherwise the next reader would
-        start a second concurrent readline() on the same fd (the exact race
-        behind split/interleaved lines on a client-connect or reconnect).
+        Framing is done here rather than with pyserial's readline(): readline()
+        returns whatever it has when its timeout fires, so a read that lands
+        mid-line yields an unterminated fragment that is indistinguishable from
+        a real line. That silently splits one message into two garbage ones and
+        destroys any ok it was carrying. Instead we accumulate raw bytes in
+        _rx_buf and only ever emit content up to a newline; a partial tail stays
+        buffered until the rest of it arrives.
+
+        Reads are serialized by _read_lock so two worker threads can never touch
+        the fd at once. If this coroutine is cancelled while its worker thread is
+        still reading, it waits for that thread before releasing the lock —
+        otherwise the next reader would start a second concurrent read. The port
+        is NOT closed on cancellation: a client disconnect must not tear down the
+        serial link.
         """
         async with self._read_lock:
-            if self._serial is None:
-                raise SerialDisconnectedError("Serial port not open")
+            while True:
+                # Emit a complete line if the buffer already holds one.
+                nl = self._rx_buf.find(b"\n")
+                if nl >= 0:
+                    line = bytes(self._rx_buf[:nl])
+                    del self._rx_buf[: nl + 1]
+                    return line.decode(errors="replace").rstrip("\r")
 
-            s = self._serial  # snapshot — may be nulled by close_immediately()
-            fut = asyncio.ensure_future(asyncio.to_thread(s.readline))
-            try:
-                raw = await asyncio.shield(fut)
-            except asyncio.CancelledError:
-                # Our coroutine was cancelled but the worker thread is still
-                # reading. Wait for it before releasing the lock so no second
-                # readline() overlaps it. Do NOT close the port — a client
-                # disconnect must not tear down the serial link.
-                await asyncio.gather(fut, return_exceptions=True)
-                raise
-            except serial.SerialException as e:
-                logger.warning("Serial read error: %s", e)
-                self.close_immediately()
-                raise SerialDisconnectedError(str(e)) from e
-            except OSError as e:
-                logger.warning("Serial OS error on read: %s", e)
-                self.close_immediately()
-                raise SerialDisconnectedError(str(e)) from e
+                if self._serial is None:
+                    raise SerialDisconnectedError("Serial port not open")
 
-        if not raw:
-            # Timeout — no data within READLINE_TIMEOUT seconds, not an error
-            return ""
+                s = self._serial  # snapshot — may be nulled by close_immediately()
+                # Block for at least one byte, then take everything buffered.
+                fut = asyncio.ensure_future(
+                    asyncio.to_thread(lambda: s.read(max(1, s.in_waiting)))
+                )
+                try:
+                    chunk = await asyncio.shield(fut)
+                except asyncio.CancelledError:
+                    await asyncio.gather(fut, return_exceptions=True)
+                    raise
+                except serial.SerialException as e:
+                    logger.warning("Serial read error: %s", e)
+                    self.close_immediately()
+                    raise SerialDisconnectedError(str(e)) from e
+                except OSError as e:
+                    logger.warning("Serial OS error on read: %s", e)
+                    self.close_immediately()
+                    raise SerialDisconnectedError(str(e)) from e
 
-        return raw.decode(errors="replace").rstrip("\r\n")
+                if not chunk:
+                    # Timed out with no new bytes. Keep any partial line buffered
+                    # for the next call — never emit it as if it were complete.
+                    return ""
+
+                self._rx_buf.extend(chunk)
 
     async def write(self, data: bytes) -> None:
         """Write bytes to the serial port.

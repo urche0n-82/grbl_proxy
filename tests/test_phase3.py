@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from grbl_proxy import grbl_protocol
 from grbl_proxy.config import AutoDetectConfig, JobConfig
 from grbl_proxy.proxy_core import ProxyCore, ProxyState
 from grbl_proxy.streamer import IDLE_COMPLETE_POLLS, GrblStreamer, StreamerResult
@@ -296,6 +297,76 @@ class TestStreamerUnit:
         r = results[0]
         assert r.completed
         assert r.lines_sent == len(lines)  # every line reached the machine
+
+    async def test_interleaved_status_ack_is_recovered(self, tmp_path):
+        """The real-world corruption: GRBL interleaves its realtime status write
+        with the ok write, emitting a truncated status with the ack spliced on.
+        The ack MUST still be counted or flow control drifts permanently.
+
+        Captured from hardware:
+          '<Run|MPos:201.275,148.225,0.000|Bf:0,65459|FS:1501,3|Ov:100,100,ok'
+        """
+        gcode = tmp_path / "test.gcode"
+        lines = ["G1 X1Y1", "G1 X2Y2", "G1 X3Y3"]
+        _write_gcode_file(gcode, lines)
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        # Window small enough that a lost ack would stall the send immediately.
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=12)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            # Every ack arrives mangled — none is a clean "ok".
+            for _ in lines:
+                mock.inject(
+                    "<Run|MPos:201.275,148.225,0.000|Bf:0,65459|FS:1501,3|Ov:100,100,ok"
+                )
+                await asyncio.sleep(0.03)
+
+        task = asyncio.create_task(streamer.run())
+        await feed()
+        await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert r.completed
+        assert r.lines_sent == len(lines)  # every ack was recovered
+
+    async def test_buffer_resyncs_from_bf_report(self, tmp_path):
+        """A drifted in-flight counter must self-correct from GRBL's own Bf:
+        report rather than accumulating until the window deadlocks."""
+        gcode = tmp_path / "test.gcode"
+        _write_gcode_file(gcode, ["G1 X1Y1"])
+        mock = MockSerialConnection(auto_respond=False)
+        streamer = GrblStreamer(gcode, mock, on_done=lambda r: None, rx_buffer_size=128)
+
+        # Learn capacity (idle: all 65535 free), then a report showing 76 bytes
+        # outstanding while our local counter wrongly believes 120.
+        idle = grbl_protocol.parse_status_report(
+            "<Idle|MPos:0,0,0|Bf:127,65535|FS:0,0>"
+        )
+        busy = grbl_protocol.parse_status_report(
+            "<Run|MPos:1,2,0|Bf:0,65459|FS:1501,3>"
+        )
+        assert streamer._reconcile_buffer(idle, 0) == 0        # capacity learned
+        assert streamer._reconcile_buffer(busy, 120) == 76     # drift corrected
+        # Never inflates a healthy counter.
+        assert streamer._reconcile_buffer(busy, 10) == 10
+
+    async def test_polling_is_inline_not_concurrent(self, tmp_path):
+        """'?' must be emitted by the streaming coroutine itself — no separate
+        poll task — so one owner writes every byte to the port."""
+        gcode = tmp_path / "test.gcode"
+        _write_gcode_file(gcode, ["G1 X1Y1", "G1 X2Y2"])
+        mock = MockSerialConnection(auto_respond=True)
+        results = []
+        streamer = GrblStreamer(
+            gcode, mock, on_done=results.append, poll_interval=0.0
+        )
+        await asyncio.wait_for(streamer.run(), timeout=3.0)
+
+        assert results[0].completed
+        assert b"?" in b"".join(mock.tx_log)  # polled inline during streaming
+        assert not hasattr(streamer, "_poll_loop")  # concurrent poller is gone
 
     async def test_run_state_does_not_falsely_complete(self, tmp_path):
         """A Run status in the trailing drain must NOT complete the job — only

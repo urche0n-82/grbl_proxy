@@ -20,24 +20,27 @@ from grbl_proxy.serial_conn import SerialConnection
 
 
 class _BlockingSerial:
-    """Fake pyserial Serial whose readline() blocks until released, tracking
-    how many readline() calls are simultaneously in flight."""
+    """Fake pyserial Serial whose read() blocks until released, tracking how
+    many read() calls are simultaneously in flight."""
 
-    def __init__(self) -> None:
+    def __init__(self, payload: bytes = b"ok\r\n") -> None:
         self._lock = threading.Lock()
-        self.active = 0          # readline() calls currently running
+        self.active = 0          # read() calls currently running
         self.max_active = 0      # high-water mark of concurrent calls
-        self.calls = 0           # total readline() calls started
+        self.calls = 0           # total read() calls started
         self.release = threading.Event()
+        self._payload = payload
 
-    def readline(self) -> bytes:
+    in_waiting = 0  # forces read(max(1, in_waiting)) -> read(1)-style blocking
+
+    def read(self, _n: int = 1) -> bytes:
         with self._lock:
             self.active += 1
             self.calls += 1
             self.max_active = max(self.max_active, self.active)
         try:
             self.release.wait(timeout=2.0)
-            return b"ok\r\n"
+            return self._payload
         finally:
             with self._lock:
                 self.active -= 1
@@ -46,11 +49,61 @@ class _BlockingSerial:
         pass
 
 
-def _make_conn(fake: _BlockingSerial) -> SerialConnection:
+class _ScriptedSerial:
+    """Fake serial that hands back a scripted sequence of raw chunks, letting a
+    test split a line across reads (b"o", b"k\\r\\n") the way a timing-unlucky
+    read would."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = list(chunks)
+
+    in_waiting = 0
+
+    def read(self, _n: int = 1) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        pass
+
+
+def _make_conn(fake) -> SerialConnection:
     conn = SerialConnection(SerialConfig(port="/dev/null"), port="/dev/null")
     conn._serial = fake  # inject fake device
     conn._connected.set()
     return conn
+
+
+class TestLineFraming:
+    """read_line() must only ever emit complete, newline-terminated lines. A
+    read landing mid-line has to buffer the fragment, not hand it back as a
+    line — that would split one message into two garbage ones and destroy any
+    ok it carried (permanent flow-control drift)."""
+
+    async def test_line_split_across_reads_is_reassembled(self):
+        # "ok\r\n" arriving as three separate reads must yield exactly one line.
+        conn = _make_conn(_ScriptedSerial([b"o", b"k", b"\r\n"]))
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == "ok"
+
+    async def test_partial_tail_is_not_emitted_on_timeout(self):
+        # Data, then a timeout (b"") mid-line: the fragment must stay buffered
+        # and read_line must report "no data" rather than inventing a line.
+        conn = _make_conn(_ScriptedSerial([b"ok\r\nGrb", b"", b"l 1.1f\r\n"]))
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == "ok"
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == ""  # idle tick
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == "Grbl 1.1f"
+
+    async def test_multiple_lines_in_one_chunk_are_split(self):
+        conn = _make_conn(_ScriptedSerial([b"ok\r\nok\r\n<Idle|FS:0,0>\r\n"]))
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == "ok"
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == "ok"
+        assert await asyncio.wait_for(conn.read_line(), timeout=2.0) == "<Idle|FS:0,0>"
+
+    async def test_close_discards_partial_line(self):
+        conn = _make_conn(_ScriptedSerial([b"partial-frag"]))
+        await asyncio.wait_for(conn.read_line(), timeout=2.0)  # buffers the tail
+        assert conn._rx_buf  # fragment retained
+        conn.close_immediately()
+        assert not conn._rx_buf  # and dropped on close, not carried over
 
 
 async def test_concurrent_reads_are_serialized():

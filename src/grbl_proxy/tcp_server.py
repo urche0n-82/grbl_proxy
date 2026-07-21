@@ -459,26 +459,33 @@ class TcpServer:
 
             serial_was_connected = True  # successful read confirms serial is live
 
-            # Snoop on status reports: log and cache for synthetic responses.
-            # The report itself is forwarded verbatim — the proxy does not
-            # rewrite GRBL's status fields.
-            if grbl_protocol.is_status_report(line):
-                status = grbl_protocol.parse_status_report(line)
-                if status:
-                    logger.debug("Machine status: %s", status)
-                    if self._proxy is not None:
-                        self._proxy.update_last_status(status)
+            # One serial line can carry more than one protocol message when the
+            # firmware interleaves a realtime status report with an ok/error
+            # write. Split them so LightBurn receives well-formed lines rather
+            # than a truncated status with an ack glued onto it.
+            for message in grbl_protocol.split_responses(line):
+                # Snoop on status reports: log and cache for synthetic responses.
+                # The report itself is forwarded verbatim — the proxy does not
+                # rewrite GRBL's status fields.
+                if grbl_protocol.is_status_report(message):
+                    status = grbl_protocol.parse_status_report(message)
+                    if status:
+                        logger.debug("Machine status: %s", status)
+                        if self._proxy is not None:
+                            self._proxy.update_last_status(status)
 
-            # Re-terminate with CR+LF to match a real GRBL device — read_line()
-            # stripped whatever the firmware used. A bare "\n" here can leave a
-            # strict LightBurn parser waiting for a line it considers complete.
-            encoded = (line + grbl_protocol.LINE_TERMINATOR).encode()
-            logger.debug("Serial→TCP: %r", encoded)
+                # Re-terminate with CR+LF to match a real GRBL device — read_line()
+                # stripped whatever the firmware used. A bare "\n" here can leave a
+                # strict LightBurn parser waiting for a line it considers complete.
+                encoded = (message + grbl_protocol.LINE_TERMINATOR).encode()
+                logger.debug("Serial→TCP: %r", encoded)
 
-            try:
-                writer.write(encoded)
-                await writer.drain()
-            except (BrokenPipeError, ConnectionResetError) as e:
-                logger.debug("TCP write error (client gone): %s", e)
-                stop_relay.set()
+                try:
+                    writer.write(encoded)
+                    await writer.drain()
+                except (BrokenPipeError, ConnectionResetError) as e:
+                    logger.debug("TCP write error (client gone): %s", e)
+                    stop_relay.set()
+                    break
+            if stop_relay.is_set():
                 break
