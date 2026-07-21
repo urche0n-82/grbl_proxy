@@ -427,6 +427,64 @@ class TestStreamerUnit:
         assert "unrecognized" not in caplog.text
         assert "Pgm End" not in caplog.text  # not surfaced as a problem
 
+    async def test_vendor_machine_fault_halts_the_job(self, tmp_path, caplog):
+        """Creality pushes machine-level faults as "ERROR:04." (uppercase,
+        zero-padded, period-terminated) — e.g. the airflow interlock, which
+        physically stops the machine while it still reports <Idle>. A
+        case-sensitive "error:" test missed it entirely and the streamer kept
+        feeding G-code to a controller that had stopped working.
+        """
+        gcode = tmp_path / "test.gcode"
+        lines = [f"G1 X{i}Y{i}" for i in range(20)]
+        _write_gcode_file(gcode, lines)
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=16)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            mock.inject("ERROR:04.")
+            # The multi-line help text that follows must not confuse anything.
+            mock.inject("    No airflow is detected and the machine has stopped working.")
+
+        with caplog.at_level(logging.ERROR, logger="grbl_proxy.streamer"):
+            task = asyncio.create_task(streamer.run())
+            await feed()
+            await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert not r.completed
+        assert r.lines_sent < len(lines)          # stopped, did not keep feeding
+        assert r.message and "ERROR:04." in r.message
+        # Reported as a machine fault, not mapped onto GRBL's error table
+        # (where 4 means something unrelated).
+        assert r.error_code is None
+        assert "machine fault" in caplog.text.lower()
+
+    async def test_vendor_boot_chatter_is_not_corruption(self, tmp_path, caplog):
+        """The controller's boot lines use "[OK]" as a *prefix* rather than a
+        closed bracket. They carry no ack and must not be logged as
+        unrecognized/corrupt responses."""
+        gcode = tmp_path / "test.gcode"
+        _write_gcode_file(gcode, ["G1 X1Y1"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            mock.inject("[OK]system start-up CV50-Pro-MASTER-Release V1.0.1")
+            mock.inject("[OK] ILmp_app_init OK")
+            mock.inject("ok")
+
+        with caplog.at_level(logging.WARNING, logger="grbl_proxy.streamer"):
+            task = asyncio.create_task(streamer.run())
+            await feed()
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert results[0].completed
+        assert "unrecognized" not in caplog.text
+
     async def test_unexpected_reset_mid_stream_stops_the_job(self, tmp_path, caplog):
         """An unplanned reboot (brownout/watchdog/EMI) loses machine position and
         queued motion, so every further line would cut from an unknown origin.

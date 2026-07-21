@@ -261,6 +261,27 @@ class GrblStreamer:
                         )
                 elif grbl_protocol.is_error(response):
                     error_code = grbl_protocol.get_error_code(response)
+                    if grbl_protocol.is_vendor_fault(response):
+                        # A machine-level fault pushed asynchronously (e.g.
+                        # "ERROR:04." = airflow interlock, machine has stopped).
+                        # Not a rejected G-code line, and its code does not map
+                        # to GRBL's error table — report it verbatim.
+                        msg = (
+                            f"machine fault {response.strip()} after "
+                            f"{self._lines_sent} lines — the controller has "
+                            f"stopped; job halted"
+                        )
+                        logger.error("Streamer: %s", msg)
+                        return StreamerResult(
+                            completed=False,
+                            cancelled=False,
+                            error_line=None,
+                            error_code=None,
+                            alarm_code=None,
+                            lines_sent=self._lines_sent,
+                            total_lines=len(lines),
+                            message=msg,
+                        )
                     logger.error(
                         "GRBL error:%s on line %d (%r)",
                         error_code, i + 1, line

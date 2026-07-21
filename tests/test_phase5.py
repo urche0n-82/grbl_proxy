@@ -37,6 +37,7 @@ def _make_mock_core(state: ProxyState = ProxyState.PASSTHROUGH) -> MagicMock:
     core._streamer = None
     core._buffer = None
     core._serial_conn = None
+    core._last_machine_fault = None
     core._serial_readable = asyncio.Event()
     core._serial_readable.set()
     core._serial_read_idle = asyncio.Event()
@@ -207,6 +208,26 @@ async def test_idle_poll_sends_question_mark(tmp_path):
     # All calls should be b"?"
     for call in serial.write.await_args_list:
         assert call.args[0] == b"?"
+
+
+async def test_preconnect_machine_fault_is_recorded_not_dropped(tmp_path, caplog):
+    """A fault reported while no client is connected used to be read by the idle
+    poll and discarded, so LightBurn connected blind — and this firmware keeps
+    reporting <Idle> through such a fault, so nothing else revealed it."""
+    import logging
+
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)  # starts DISCONNECTED
+    serial = _make_serial(connected=True)
+    serial.read_line = AsyncMock(side_effect=["ERROR:04.", ""])
+
+    with caplog.at_level(logging.ERROR, logger="grbl_proxy.proxy_core"):
+        await core._drain_serial(serial)
+
+    assert core._last_machine_fault == "ERROR:04."
+    assert "fault" in caplog.text.lower()
+    # And it reaches the API surface the dashboard reads.
+    assert ProxyStatus(core).snapshot().last_machine_fault == "ERROR:04."
 
 
 async def test_idle_poll_skips_when_executing(tmp_path):

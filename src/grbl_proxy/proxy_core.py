@@ -156,6 +156,10 @@ class ProxyCore:
         # Set by an explicit user cancel (web UI) so _on_streamer_done can
         # distinguish intentional cancel from unexpected abort (serial disconnect etc.)
         self._user_cancelled: bool = False
+        # Last fault the machine reported while no client was connected. Kept so
+        # the dashboard/API can show that the controller faulted before this
+        # session began — otherwise it is read by the idle poll and lost.
+        self._last_machine_fault: str | None = None
 
     # ------------------------------------------------------------------
     # State transition entry points (called by TcpServer)
@@ -643,6 +647,19 @@ class ProxyCore:
                 status = grbl_protocol.parse_status_report(line)
                 if status:
                     self.update_last_status(status)
+            elif grbl_protocol.is_error(line) or grbl_protocol.is_alarm(line):
+                # A fault reported while no client is connected would otherwise
+                # be read here and dropped: LightBurn then connects blind, and
+                # this firmware keeps reporting <Idle> even when a fault has
+                # physically stopped the machine, so nothing else reveals it.
+                # Record it and log loudly — it is the only warning the operator
+                # will get before the first job of the session silently stalls.
+                self._last_machine_fault = line.strip()
+                logger.error(
+                    "Machine reported a fault while no client was connected: "
+                    "%s — this can stop motion until the controller is reset",
+                    self._last_machine_fault,
+                )
 
     async def shutdown(self) -> None:
         """Cancel streamer task cleanly. Called by TcpServer.stop()."""

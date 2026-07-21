@@ -192,9 +192,29 @@ def is_ok(line: str) -> bool:
     return line.strip() == "ok"
 
 
+# Standard GRBL answers a bad line with "error:9". Creality's CV50 firmware
+# additionally pushes machine-level faults in an uppercase, zero-padded,
+# period-terminated form — "ERROR:04." for the airflow interlock, followed by
+# several indented lines of help text. A case-sensitive prefix test missed that
+# form entirely, so a fault that had physically stopped the machine looked like
+# unrecognized noise and the streamer kept feeding it G-code.
+_ERROR_RE = re.compile(r"^error:\s*(\d+)\s*\.?$", re.IGNORECASE)
+
+
 def is_error(line: str) -> bool:
-    """Return True if line is a GRBL error response (error:N)."""
-    return line.strip().startswith("error:")
+    """Return True if line is a GRBL error response (error:N / ERROR:NN.)."""
+    return _ERROR_RE.match(line.strip()) is not None
+
+
+def is_vendor_fault(line: str) -> bool:
+    """Return True for the uppercase vendor fault form ("ERROR:04.").
+
+    Distinguishable from a standard `error:N` reply so it can be reported as
+    what it is — a machine-level fault, not a rejected G-code line. The numeric
+    codes do NOT share meanings with stock GRBL's error table.
+    """
+    s = line.strip()
+    return _ERROR_RE.match(s) is not None and s.startswith("ERROR:")
 
 
 def is_alarm(line: str) -> bool:
@@ -211,12 +231,16 @@ def is_feedback_message(line: str) -> bool:
 
         [MSG:Pgm End]            program end (M2/M30), emitted just before ok
         [MSG:Using cpu_map...]   boot banner detail
+        [OK]system start-up ...  vendor boot chatter — bracket is only a PREFIX
+        [OK] ILmp_app_init OK    (so an endswith("]") test would miss these)
         [VER:...] [OPT:...]      $I build info
         [G54:...] [TLO:] [PRB:]  $# coordinate/probe report
         [GC:...]                 $G parser state
     """
-    s = line.strip()
-    return s.startswith("[") and s.endswith("]")
+    # A leading bracket is sufficient: nothing else in the GRBL response
+    # vocabulary starts with one, and requiring a closing bracket would reject
+    # the vendor "[OK]..." boot lines above as unrecognized corruption.
+    return line.strip().startswith("[")
 
 
 def is_grbl_greeting(line: str) -> bool:
@@ -237,11 +261,11 @@ def is_motion_command(line: str) -> bool:
 
 
 def get_error_code(line: str) -> int | None:
-    """Extract the numeric error code from an error:N response."""
-    s = line.strip()
-    if s.startswith("error:"):
+    """Extract the numeric code from an error:N / ERROR:NN. response."""
+    m = _ERROR_RE.match(line.strip())
+    if m:
         try:
-            return int(s[6:])
+            return int(m.group(1))  # int() also strips vendor zero-padding
         except ValueError:
             pass
     return None

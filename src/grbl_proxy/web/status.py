@@ -36,6 +36,11 @@ class StatusSnapshot:
     job_elapsed_s: float | None
     serial_connected: bool     # True when serial port is open
     timestamp: float           # time.monotonic() at snapshot time
+    # Fault the machine reported while no client was connected (e.g. Creality's
+    # "ERROR:04." airflow interlock at boot). Surfaced because the firmware
+    # keeps reporting <Idle> through such a fault, so this is the only signal
+    # that the first job of a session may silently stall.
+    last_machine_fault: str | None = None
 
 
 class ProxyStatus:
@@ -102,6 +107,12 @@ class ProxyStatus:
             job_progress_pct=progress_pct,
             job_elapsed_s=elapsed_s,
             serial_connected=serial_connected,
+            # Coerce to str|None: this snapshot is JSON-serialised for the API
+            # and WebSocket, so a non-string here would break every broadcast.
+            last_machine_fault=(
+                fault if isinstance(fault := getattr(core, "_last_machine_fault", None), str)
+                else None
+            ),
             timestamp=time.monotonic(),
         )
 

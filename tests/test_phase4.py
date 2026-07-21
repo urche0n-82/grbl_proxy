@@ -36,6 +36,7 @@ def _make_mock_core(state: ProxyState = ProxyState.PASSTHROUGH) -> MagicMock:
     core._buffer = None
     core._serial_conn = None
     core._has_tcp_client = False
+    core._last_machine_fault = None
     return core
 
 
