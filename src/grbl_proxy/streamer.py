@@ -193,12 +193,33 @@ class GrblStreamer:
 
             line_bytes = len(line.encode()) + 1  # +1 for \n
 
-            # Drain responses until there is room in GRBL's RX buffer
+            # Drain responses until there is room in GRBL's RX buffer.
+            #
+            # This loop MUST stay interruptible: it can block for a long time
+            # (waiting on acks), and a cancel arriving mid-drain has to take
+            # effect here — checking _cancelled only between lines means a
+            # wedged drain ignores every cancel the operator issues.
+            idle_polls = 0
             while buffer_used + line_bytes > self._rx_buffer_size:
+                if self._cancelled:
+                    logger.warning(
+                        "Streamer: cancelled while draining acks (after %d lines)",
+                        self._lines_sent,
+                    )
+                    return StreamerResult(
+                        completed=False,
+                        cancelled=True,
+                        error_line=None,
+                        error_code=None,
+                        alarm_code=None,
+                        lines_sent=self._lines_sent,
+                        total_lines=len(lines),
+                    )
                 response = await self._serial.read_line()
                 if not response:
                     continue  # serial timeout tick, keep waiting
                 if grbl_protocol.is_ok(response):
+                    idle_polls = 0
                     if line_lengths:
                         buffer_used -= line_lengths.popleft()
                     else:
@@ -239,10 +260,34 @@ class GrblStreamer:
                         total_lines=len(lines),
                     )
                 elif grbl_protocol.is_status_report(response):
-                    if self._on_status:
-                        status = grbl_protocol.parse_status_report(response)
-                        if status:
+                    status = grbl_protocol.parse_status_report(response)
+                    if status:
+                        if self._on_status:
                             self._on_status(status)
+                        # Sustained Idle while we're still waiting for buffer
+                        # room is a contradiction: an idle GRBL has an empty
+                        # planner and a drained RX, so it owes us nothing and
+                        # has room for everything. It means an ack went missing
+                        # and our byte accounting is stale — without this the
+                        # drain spins forever and wedges the job mid-stream.
+                        # Reconcile and keep streaming (the job is NOT done;
+                        # there are still lines to send).
+                        if status.get("state") == "Idle":
+                            idle_polls += 1
+                            if idle_polls >= IDLE_COMPLETE_POLLS:
+                                logger.warning(
+                                    "Streamer: GRBL Idle with %d byte(s) still "
+                                    "marked in flight after %d lines — ack "
+                                    "accounting lost, reconciling and resuming",
+                                    buffer_used,
+                                    self._lines_sent,
+                                )
+                                buffer_used = 0
+                                line_lengths.clear()
+                                idle_polls = 0
+                                break  # room now — send the next line
+                        else:
+                            idle_polls = 0
 
             # Send the line
             await self._serial.write((line + "\n").encode())
@@ -271,6 +316,23 @@ class GrblStreamer:
         )
         idle_polls = 0
         while line_lengths:
+            # Stay cancellable here too — the trailing drain can block for a
+            # long time waiting on final acks.
+            if self._cancelled:
+                logger.warning(
+                    "Streamer: cancelled while draining trailing acks "
+                    "(after %d lines)",
+                    self._lines_sent,
+                )
+                return StreamerResult(
+                    completed=False,
+                    cancelled=True,
+                    error_line=None,
+                    error_code=None,
+                    alarm_code=None,
+                    lines_sent=self._lines_sent,
+                    total_lines=len(lines),
+                )
             response = await self._serial.read_line()
             if not response:
                 continue

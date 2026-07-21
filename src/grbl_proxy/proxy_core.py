@@ -296,6 +296,10 @@ class ProxyCore:
 
         # Soft reset during EXECUTING/PAUSED — cancel job
         if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED) and byte == 0x18:
+            # Mark this as a deliberate operator cancel so _on_streamer_done
+            # returns to Passthrough/Disconnected instead of latching ERROR
+            # (which would then need $X/$H to clear). Mirrors the web cancel.
+            self._user_cancelled = True
             if self._streamer is not None:
                 self._streamer.cancel()
             try:

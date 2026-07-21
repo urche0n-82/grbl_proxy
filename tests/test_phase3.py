@@ -247,6 +247,56 @@ class TestStreamerUnit:
         assert r.alarm_code is None
         assert r.lines_sent == 3
 
+    async def test_cancel_takes_effect_while_wedged_mid_stream(self, tmp_path):
+        """Cancel must break out of the mid-stream ack drain, not just between
+        lines. Regression for the production wedge: the job stalled ~64% in and
+        every cancel (LightBurn Ctrl-X and web) was ignored because _cancelled
+        was only checked between lines, which the wedged drain never reached.
+        """
+        gcode = tmp_path / "test.gcode"
+        # Lines long enough that a tiny rx_buffer forces a drain after line 1.
+        _write_gcode_file(gcode, [f"G1 X{i}Y{i}S10F6000" for i in range(20)])
+        mock = MockSerialConnection(auto_respond=False)  # GRBL never acks
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=20)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.15)  # let it send line 1 and wedge in the drain
+        assert not task.done()
+
+        streamer.cancel()
+        await asyncio.wait_for(task, timeout=2.0)  # must return promptly
+
+        r = results[0]
+        assert r.cancelled
+        assert not r.completed
+
+    async def test_idle_mid_stream_reconciles_and_resumes(self, tmp_path):
+        """If an ack goes missing mid-job, a sustained Idle from GRBL means our
+        byte accounting is stale — the streamer must reconcile and finish the
+        job rather than spinning in the drain forever."""
+        gcode = tmp_path / "test.gcode"
+        lines = [f"G1 X{i}Y{i}S10F6000" for i in range(5)]
+        _write_gcode_file(gcode, lines)
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=20)
+
+        async def feed():
+            # Never ack anything — only report Idle. The streamer should notice
+            # the contradiction, reconcile, and push the rest of the job out.
+            for _ in range((IDLE_COMPLETE_POLLS + 1) * (len(lines) + 1)):
+                await asyncio.sleep(0.02)
+                mock.inject_status(state="Idle")
+
+        task = asyncio.create_task(streamer.run())
+        await feed()
+        await asyncio.wait_for(task, timeout=5.0)
+
+        r = results[0]
+        assert r.completed
+        assert r.lines_sent == len(lines)  # every line reached the machine
+
     async def test_run_state_does_not_falsely_complete(self, tmp_path):
         """A Run status in the trailing drain must NOT complete the job — only
         sustained Idle does. Guards the Idle fallback against premature exit."""
