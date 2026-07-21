@@ -331,26 +331,115 @@ class TestStreamerUnit:
         assert r.completed
         assert r.lines_sent == len(lines)  # every ack was recovered
 
-    async def test_buffer_resyncs_from_bf_report(self, tmp_path):
-        """A drifted in-flight counter must self-correct from GRBL's own Bf:
-        report rather than accumulating until the window deadlocks."""
+    def _streamer_with_capacity(self, tmp_path):
+        """A streamer that has learned GRBL's 65535-byte RX capacity."""
         gcode = tmp_path / "test.gcode"
         _write_gcode_file(gcode, ["G1 X1Y1"])
-        mock = MockSerialConnection(auto_respond=False)
-        streamer = GrblStreamer(gcode, mock, on_done=lambda r: None, rx_buffer_size=128)
-
-        # Learn capacity (idle: all 65535 free), then a report showing 76 bytes
-        # outstanding while our local counter wrongly believes 120.
+        s = GrblStreamer(
+            gcode, MockSerialConnection(auto_respond=False),
+            on_done=lambda r: None, rx_buffer_size=128,
+        )
         idle = grbl_protocol.parse_status_report(
             "<Idle|MPos:0,0,0|Bf:127,65535|FS:0,0>"
         )
-        busy = grbl_protocol.parse_status_report(
-            "<Run|MPos:1,2,0|Bf:0,65459|FS:1501,3>"
+        assert s._buffer_looks_phantom(idle, 0) is False  # learns capacity
+        assert s._rx_capacity == 65535
+        return s
+
+    async def test_normal_transit_lag_is_not_treated_as_drift(self, tmp_path):
+        """buffer_used counts bytes sent-but-unacked; Bf's rx_free counts bytes
+        still unparsed. GRBL frees RX space as soon as it parses a line, so ours
+        legitimately reads higher during healthy streaming. That ordinary gap
+        must never trigger a resync.
+
+        These are the real rx_free figures captured mid-job, every one of which
+        the first implementation wrongly "corrected".
+        """
+        s = self._streamer_with_capacity(tmp_path)
+        for rx_free, believed in (
+            (65416, 122), (65424, 128), (65417, 120), (65435, 118), (65475, 121)
+        ):
+            status = grbl_protocol.parse_status_report(
+                f"<Run|MPos:1,2,0|Bf:0,{rx_free}|FS:1501,3>"
+            )
+            # Repeat well past the streak threshold — a busy RX never qualifies.
+            for _ in range(IDLE_COMPLETE_POLLS + 2):
+                assert s._buffer_looks_phantom(status, believed) is False
+
+    async def test_sustained_drained_rx_is_phantom(self, tmp_path):
+        """A drained RX held across consecutive polls, while we still believe
+        bytes are outstanding, is genuine evidence an ack was lost."""
+        s = self._streamer_with_capacity(tmp_path)
+        drained = grbl_protocol.parse_status_report(
+            "<Run|MPos:1,2,0|Bf:0,65535|FS:1501,3>"
         )
-        assert streamer._reconcile_buffer(idle, 0) == 0        # capacity learned
-        assert streamer._reconcile_buffer(busy, 120) == 76     # drift corrected
-        # Never inflates a healthy counter.
-        assert streamer._reconcile_buffer(busy, 10) == 10
+        # Not enough consecutive reports yet.
+        for _ in range(IDLE_COMPLETE_POLLS - 1):
+            assert s._buffer_looks_phantom(drained, 117) is False
+        assert s._buffer_looks_phantom(drained, 117) is True
+
+    async def test_busy_report_resets_the_drained_streak(self, tmp_path):
+        s = self._streamer_with_capacity(tmp_path)
+        drained = grbl_protocol.parse_status_report(
+            "<Run|MPos:1,2,0|Bf:0,65535|FS:1501,3>"
+        )
+        busy = grbl_protocol.parse_status_report(
+            "<Run|MPos:1,2,0|Bf:0,65416|FS:1501,3>"
+        )
+        for _ in range(IDLE_COMPLETE_POLLS - 1):
+            assert s._buffer_looks_phantom(drained, 117) is False
+        assert s._buffer_looks_phantom(busy, 117) is False  # streak broken
+        assert s._buffer_looks_phantom(drained, 117) is False  # counting anew
+
+    async def test_nothing_in_flight_is_never_phantom(self, tmp_path):
+        s = self._streamer_with_capacity(tmp_path)
+        drained = grbl_protocol.parse_status_report(
+            "<Idle|MPos:0,0,0|Bf:127,65535|FS:0,0>"
+        )
+        for _ in range(IDLE_COMPLETE_POLLS + 2):
+            assert s._buffer_looks_phantom(drained, 0) is False
+
+    async def test_flow_control_counter_never_goes_negative(self, tmp_path):
+        """buffer_used must always equal sum(line_lengths). The first Bf resync
+        mutated buffer_used without touching line_lengths, so later acks
+        subtracted bytes already removed and drove the counter negative —
+        which makes `buffer_used + line_bytes > window` permanently false and
+        silently disables the send window altogether.
+
+        Streams a job while GRBL reports a busy RX throughout (normal transit
+        lag) and asserts the window keeps working.
+        """
+        gcode = tmp_path / "test.gcode"
+        lines = [f"G1 X{i}Y{i}" for i in range(12)]
+        _write_gcode_file(gcode, lines)
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(
+            gcode, mock, on_done=results.append, rx_buffer_size=32
+        )
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            for _ in lines:
+                # A status showing a *busy* RX (the case that used to resync),
+                # then a clean ack — the healthy steady state.
+                mock.inject("<Run|MPos:1,2,0|Bf:0,65416|FS:1501,3>")
+                mock.inject("ok")
+                await asyncio.sleep(0.01)
+            for _ in range(IDLE_COMPLETE_POLLS + 1):
+                await asyncio.sleep(0.02)
+                mock.inject_status(state="Idle")
+
+        task = asyncio.create_task(streamer.run())
+        await feed()
+        await asyncio.wait_for(task, timeout=5.0)
+
+        r = results[0]
+        assert r.completed
+        assert r.lines_sent == len(lines)
+        # A negative counter would have let every line through at once; the
+        # window must have actually throttled and stayed coherent.
+        assert streamer._rx_drained_polls >= 0
 
     async def test_polling_is_inline_not_concurrent(self, tmp_path):
         """'?' must be emitted by the streaming coroutine itself — no separate

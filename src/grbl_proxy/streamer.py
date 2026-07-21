@@ -31,6 +31,10 @@ POLL_INTERVAL = 0.25   # seconds — 4 Hz status polling during execution
 # sustained Idle — long enough to rule out a momentary pre-motion Idle.
 IDLE_COMPLETE_POLLS = 3
 
+# Bytes of GRBL RX occupancy still counted as "drained". Anything at or below
+# this means the controller has parsed everything we sent it.
+RX_DRAINED_MARGIN = 8
+
 
 @dataclass
 class StreamerResult:
@@ -81,10 +85,13 @@ class GrblStreamer:
         # Inline polling state (single serial owner — see _maybe_poll).
         self._last_poll = 0.0
         # Largest RX-free figure GRBL has reported, i.e. its true buffer
-        # capacity (observed when idle). Used to convert a reported rx_free into
-        # "bytes actually outstanding" so a drifted local counter can be
-        # corrected against the machine's own view.
+        # capacity (observed when idle). Used to tell a genuinely drained
+        # controller RX from one that is simply busy.
         self._rx_capacity = 0
+        # Consecutive status reports showing a drained RX while we still believe
+        # bytes are in flight. Only a sustained streak is treated as evidence
+        # that our accounting is stale — see _buffer_looks_phantom.
+        self._rx_drained_polls = 0
 
     # ------------------------------------------------------------------
     # Public interface
@@ -233,6 +240,9 @@ class GrblStreamer:
                     continue  # serial timeout tick, keep waiting
                 if grbl_protocol.is_ok(response):
                     idle_polls = 0
+                    # An ack is proof the accounting is tracking — any
+                    # drained-RX streak we were building is not a phantom.
+                    self._rx_drained_polls = 0
                     if line_lengths:
                         buffer_used -= line_lengths.popleft()
                     else:
@@ -277,9 +287,23 @@ class GrblStreamer:
                     if status:
                         if self._on_status:
                             self._on_status(status)
-                        # Trust the machine's own buffer report over our locally
-                        # accumulated count, which can only drift upward.
-                        buffer_used = self._reconcile_buffer(status, buffer_used)
+                        # A sustained drained RX proves our count is stale.
+                        # Reset BOTH halves together: buffer_used and
+                        # line_lengths must stay consistent or later acks
+                        # subtract bytes already removed and drive the counter
+                        # negative, silently disabling the window entirely.
+                        if self._buffer_looks_phantom(status, buffer_used):
+                            logger.warning(
+                                "Streamer: GRBL RX drained for %d polls with %d "
+                                "byte(s) still marked in flight after %d lines "
+                                "— ack lost, resyncing",
+                                self._rx_drained_polls, buffer_used,
+                                self._lines_sent,
+                            )
+                            buffer_used = 0
+                            line_lengths.clear()
+                            self._rx_drained_polls = 0
+                            break  # room now — send the next line
                         # Sustained Idle while we're still waiting for buffer
                         # room is a contradiction: an idle GRBL has an empty
                         # planner and a drained RX, so it owes us nothing and
@@ -475,31 +499,38 @@ class GrblStreamer:
                 return ""
         return pending.popleft()
 
-    def _reconcile_buffer(
+    def _buffer_looks_phantom(
         self, status: grbl_protocol.StatusReport, buffer_used: int
-    ) -> int:
-        """Correct the local in-flight byte count against GRBL's own report.
+    ) -> bool:
+        """True when GRBL's own report proves our in-flight count is stale.
 
-        buffer_used is accumulated locally (add on send, subtract on ack) and so
-        can only ever drift upward when an ack is lost — permanently, until the
-        window fills and streaming deadlocks. GRBL publishes the truth in
-        Bf:<planner free>,<rx free> several times a second; if it says more room
-        is available than we believe, trust the machine and resync.
+        Deliberately conservative. `buffer_used` counts bytes *sent but not yet
+        acked*; GRBL's `Bf:` rx_free reflects bytes *still unparsed in its RX
+        buffer*. Those are different quantities — the controller frees RX space
+        the moment it parses a line, well before that line's ok reaches us — so
+        `capacity - rx_free` is legitimately smaller than `buffer_used` during
+        completely healthy streaming. Treating that ordinary gap as drift fires
+        constantly and, worse, desyncs `buffer_used` from `line_lengths`.
+
+        So only a *drained* RX counts, and only when sustained: acks never take
+        IDLE_COMPLETE_POLLS polls (~0.75s at 4 Hz) to arrive, so a controller
+        that keeps reporting an empty RX while we still believe bytes are
+        outstanding has genuinely lost us an ack.
         """
         bf = status.get("bf")
         if not bf:
-            return buffer_used
+            return False
         rx_free = bf[1]
         # Capacity == the most free space ever reported (i.e. when fully idle).
         self._rx_capacity = max(self._rx_capacity, rx_free)
-        if not self._rx_capacity:
-            return buffer_used
-        implied_used = max(0, self._rx_capacity - rx_free)
-        if implied_used < buffer_used:
-            logger.debug(
-                "Streamer: resyncing in-flight %d → %d bytes from GRBL Bf "
-                "(rx_free=%d, capacity=%d)",
-                buffer_used, implied_used, rx_free, self._rx_capacity,
-            )
-            return implied_used
-        return buffer_used
+
+        if not self._rx_capacity or buffer_used <= 0:
+            self._rx_drained_polls = 0
+            return False
+
+        if (self._rx_capacity - rx_free) > RX_DRAINED_MARGIN:
+            self._rx_drained_polls = 0  # RX still holds data — normal, not drift
+            return False
+
+        self._rx_drained_polls += 1
+        return self._rx_drained_polls >= IDLE_COMPLETE_POLLS
