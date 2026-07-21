@@ -288,6 +288,21 @@ class GrblStreamer:
                                 break  # room now — send the next line
                         else:
                             idle_polls = 0
+                else:
+                    # Anything that is not ok / error / ALARM / <status> was
+                    # previously discarded silently. If GRBL's response was
+                    # mangled (e.g. a realtime status report interleaving with
+                    # an 'ok' write, producing "o<Idle|...>k"), the ack it
+                    # carried vanishes here and buffer_used drifts up for the
+                    # rest of the job. Log it so the leak is visible instead of
+                    # only surfacing later as "ack accounting lost".
+                    logger.warning(
+                        "Streamer: unrecognized serial response %r after %d "
+                        "lines — if it carried an 'ok', ack accounting just "
+                        "drifted by one line",
+                        response,
+                        self._lines_sent,
+                    )
 
             # Send the line
             await self._serial.write((line + "\n").encode())
@@ -388,6 +403,15 @@ class GrblStreamer:
                             break
                     else:
                         idle_polls = 0
+            else:
+                # See the matching branch in the send loop: a response that
+                # matches nothing is a silently-lost ack. Surface it.
+                logger.warning(
+                    "Streamer: unrecognized serial response %r in trailing "
+                    "drain (%d line(s) still unacked)",
+                    response,
+                    len(line_lengths),
+                )
 
         return StreamerResult(
             completed=True,
