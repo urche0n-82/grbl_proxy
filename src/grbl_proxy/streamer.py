@@ -47,6 +47,10 @@ class StreamerResult:
     alarm_code: int | None  # The N in ALARM:N, or None
     lines_sent: int         # Lines successfully written to serial before stopping
     total_lines: int        # Total non-blank lines in the file
+    # Human-readable reason for an abort that isn't an error:N/ALARM:N — e.g. an
+    # unexpected controller reset. Logged by ProxyCore._on_streamer_done so the
+    # operator sees *why* the job stopped instead of a silent ERROR state.
+    message: str | None = None
 
 
 class GrblStreamer:
@@ -328,14 +332,48 @@ class GrblStreamer:
                                 break  # room now — send the next line
                         else:
                             idle_polls = 0
+                elif grbl_protocol.is_feedback_message(response):
+                    # Informational push/query output ([MSG:...], [GC:...], ...).
+                    # Carries no ack — read past it without touching accounting.
+                    logger.debug("Streamer: GRBL message %s", response)
+                elif grbl_protocol.is_grbl_greeting(response):
+                    # A banner means the controller rebooted. Distinguish who
+                    # caused it: an operator Stop (LightBurn Ctrl-X or the web
+                    # cancel) forwards 0x18 to GRBL *after* setting _cancelled,
+                    # so a banner with _cancelled set is the expected echo of a
+                    # deliberate cancel — the _cancelled check at the top of the
+                    # loop ends the run cleanly. Anything else is an unplanned
+                    # reset (brownout, watchdog, EMI): position and queued
+                    # motion are gone, so every further line would execute from
+                    # an unknown origin. Stop immediately.
+                    if self._cancelled:
+                        logger.debug(
+                            "Streamer: GRBL banner after cancel (expected)"
+                        )
+                    else:
+                        msg = (
+                            f"GRBL reset unexpectedly mid-stream after "
+                            f"{self._lines_sent} lines — machine position is no "
+                            f"longer trustworthy; re-home before resuming"
+                        )
+                        logger.error("Streamer: %s (%r)", msg, response)
+                        return StreamerResult(
+                            completed=False,
+                            cancelled=False,
+                            error_line=None,
+                            error_code=None,
+                            alarm_code=None,
+                            lines_sent=self._lines_sent,
+                            total_lines=len(lines),
+                            message=msg,
+                        )
                 else:
-                    # Anything that is not ok / error / ALARM / <status> was
-                    # previously discarded silently. If GRBL's response was
-                    # mangled (e.g. a realtime status report interleaving with
-                    # an 'ok' write, producing "o<Idle|...>k"), the ack it
-                    # carried vanishes here and buffer_used drifts up for the
-                    # rest of the job. Log it so the leak is visible instead of
-                    # only surfacing later as "ack accounting lost".
+                    # Anything left is a genuinely unknown response. If GRBL's
+                    # write was mangled (a realtime status interleaving with an
+                    # 'ok', e.g. "<Run|...|Ov:100,100,ok"), the ack it carried
+                    # vanishes here and buffer_used drifts up for the rest of
+                    # the job — so make the leak visible rather than letting it
+                    # surface later as an unexplained stall.
                     logger.warning(
                         "Streamer: unrecognized serial response %r after %d "
                         "lines — if it carried an 'ok', ack accounting just "
@@ -444,6 +482,34 @@ class GrblStreamer:
                             break
                     else:
                         idle_polls = 0
+            elif grbl_protocol.is_feedback_message(response):
+                # Expected here: GRBL emits [MSG:Pgm End] immediately before the
+                # ok for the job's closing M2/M30. Informational, no ack.
+                logger.debug("Streamer: GRBL message %s", response)
+            elif grbl_protocol.is_grbl_greeting(response):
+                # Same reasoning as the send loop: expected after an operator
+                # cancel, an unplanned reset otherwise. All lines are already on
+                # the machine here, but an unplanned reset means the tail of the
+                # job never ran — do not report it as completed.
+                if self._cancelled:
+                    logger.debug("Streamer: GRBL banner after cancel (expected)")
+                else:
+                    msg = (
+                        f"GRBL reset unexpectedly while draining final acks — "
+                        f"{len(line_lengths)} line(s) were still unacked; the "
+                        f"end of the job did not run"
+                    )
+                    logger.error("Streamer: %s (%r)", msg, response)
+                    return StreamerResult(
+                        completed=False,
+                        cancelled=False,
+                        error_line=None,
+                        error_code=None,
+                        alarm_code=None,
+                        lines_sent=self._lines_sent,
+                        total_lines=len(lines),
+                        message=msg,
+                    )
             else:
                 # See the matching branch in the send loop: a response that
                 # matches nothing is a silently-lost ack. Surface it.

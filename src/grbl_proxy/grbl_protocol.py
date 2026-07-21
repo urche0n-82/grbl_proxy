@@ -202,6 +202,23 @@ def is_alarm(line: str) -> bool:
     return line.strip().startswith("ALARM:")
 
 
+def is_feedback_message(line: str) -> bool:
+    """Return True for a GRBL bracketed feedback/push message.
+
+    These are informational and carry NO acknowledgement — a sender must read
+    past them without touching its ack accounting. GRBL emits them both
+    unprompted and as query output:
+
+        [MSG:Pgm End]            program end (M2/M30), emitted just before ok
+        [MSG:Using cpu_map...]   boot banner detail
+        [VER:...] [OPT:...]      $I build info
+        [G54:...] [TLO:] [PRB:]  $# coordinate/probe report
+        [GC:...]                 $G parser state
+    """
+    s = line.strip()
+    return s.startswith("[") and s.endswith("]")
+
+
 def is_grbl_greeting(line: str) -> bool:
     """Return True if line is GRBL's startup banner."""
     s = line.strip()

@@ -9,6 +9,7 @@ Tests cover:
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
@@ -398,6 +399,89 @@ class TestStreamerUnit:
         )
         for _ in range(IDLE_COMPLETE_POLLS + 2):
             assert s._buffer_looks_phantom(drained, 0) is False
+
+    async def test_feedback_messages_are_expected_not_warnings(self, tmp_path, caplog):
+        """GRBL emits [MSG:Pgm End] just before the ok for a job's closing
+        M2/M30, plus other bracketed output ([VER:], [G54:], ...). These carry
+        no ack and are a normal part of the protocol — they must not be
+        reported as unrecognized responses."""
+        gcode = tmp_path / "test.gcode"
+        _write_gcode_file(gcode, ["G1 X1Y1", "M2"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            mock.inject("ok")                 # ack for G1
+            mock.inject("[MSG:Pgm End]")      # emitted for M2, carries no ack
+            mock.inject("ok")                 # ack for M2
+
+        with caplog.at_level(logging.WARNING, logger="grbl_proxy.streamer"):
+            task = asyncio.create_task(streamer.run())
+            await feed()
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert results[0].completed
+        assert results[0].lines_sent == 2
+        assert "unrecognized" not in caplog.text
+        assert "Pgm End" not in caplog.text  # not surfaced as a problem
+
+    async def test_unexpected_reset_mid_stream_stops_the_job(self, tmp_path, caplog):
+        """An unplanned reboot (brownout/watchdog/EMI) loses machine position and
+        queued motion, so every further line would cut from an unknown origin.
+        The stream must stop rather than keep feeding the machine."""
+        gcode = tmp_path / "test.gcode"
+        lines = [f"G1 X{i}Y{i}" for i in range(20)]
+        _write_gcode_file(gcode, lines)
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=16)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            mock.inject("Grbl 1.1f ['$' for help]")  # nobody asked for this
+
+        with caplog.at_level(logging.ERROR, logger="grbl_proxy.streamer"):
+            task = asyncio.create_task(streamer.run())
+            await feed()
+            await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert not r.completed
+        assert not r.cancelled          # not an operator action — a fault
+        assert r.message and "reset" in r.message.lower()
+        assert r.lines_sent < len(lines)  # stopped early, did not keep streaming
+        assert "reset" in caplog.text.lower()
+
+    async def test_operator_cancel_banner_is_not_a_reset_fault(self, tmp_path, caplog):
+        """Hitting Stop during a buffered job forwards Ctrl-X to GRBL, which
+        reboots and greets. That banner is the expected echo of a deliberate
+        cancel and must NOT be reported as a controller fault — the run has to
+        end as a clean cancel."""
+        gcode = tmp_path / "test.gcode"
+        lines = [f"G1 X{i}Y{i}" for i in range(20)]
+        _write_gcode_file(gcode, lines)
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=16)
+
+        async def feed():
+            await asyncio.sleep(0.05)
+            # Exactly the real ordering: cancel() sets _cancelled, THEN 0x18
+            # goes to GRBL, THEN the banner comes back.
+            streamer.cancel()
+            mock.inject("Grbl 1.1f ['$' for help]")
+
+        with caplog.at_level(logging.ERROR, logger="grbl_proxy.streamer"):
+            task = asyncio.create_task(streamer.run())
+            await feed()
+            await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert r.cancelled              # clean operator cancel...
+        assert r.message is None        # ...not a reset fault
+        assert "reset" not in caplog.text.lower()
 
     async def test_flow_control_counter_never_goes_negative(self, tmp_path):
         """buffer_used must always equal sum(line_lengths). The first Bf resync

@@ -523,6 +523,23 @@ class ProxyCore:
                     result.error_code,
                     result.error_line,
                 )
+            elif result.message:
+                logger.error(
+                    "Job stopped after %d/%d lines: %s — proxy in ERROR state. "
+                    "Send $H to re-home (or $X to unlock) before resuming.",
+                    result.lines_sent,
+                    result.total_lines,
+                    result.message,
+                )
+            else:
+                # Previously silent: an abort with no code and no message left
+                # ERROR state with nothing in the log explaining why.
+                logger.error(
+                    "Job stopped unexpectedly after %d/%d lines — proxy in "
+                    "ERROR state. Send $X or $H to clear.",
+                    result.lines_sent,
+                    result.total_lines,
+                )
             self._last_error = result
             if self._state in (ProxyState.EXECUTING, ProxyState.PAUSED):
                 self._state = ProxyState.ERROR
