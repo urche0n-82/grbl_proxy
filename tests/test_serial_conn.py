@@ -16,7 +16,9 @@ import threading
 import pytest
 
 from grbl_proxy.config import SerialConfig
-from grbl_proxy.serial_conn import SerialConnection
+import serial
+
+from grbl_proxy.serial_conn import SerialConnection, SerialDisconnectedError
 
 
 class _BlockingSerial:
@@ -122,6 +124,46 @@ class TestPortRecovery:
         )
         conn._rescan_port()
         assert conn.port == "/dev/grbl-laser"
+
+    async def test_write_error_releases_the_fd(self):
+        """A failed write must CLOSE the port, not merely mark it disconnected.
+        Leaving the fd open pins the kernel node, forcing the controller to
+        re-enumerate as ttyACM1 — the actual cause of the renumbering."""
+        class _EIOSerial:
+            def write(self, data):
+                raise serial.SerialException("write failed: [Errno 5] I/O error")
+            def close(self):
+                pass
+
+        conn = self._auto_conn()
+        conn._serial = _EIOSerial()
+        conn._connected.set()
+
+        with pytest.raises(SerialDisconnectedError):
+            await conn.write(b"?")
+
+        assert conn._serial is None      # fd released...
+        assert not conn.is_connected     # ...and marked disconnected
+
+    async def test_stale_fd_after_io_error_is_swept_up(self, monkeypatch):
+        """Defence in depth: if some path leaves the fd open while marked
+        disconnected, the reconnect loop releases it on its next tick."""
+        conn = self._auto_conn()
+        conn._serial = _ScriptedSerial([])
+        conn._connected.clear()          # marked down, but fd still open (the leak)
+        # Node still present, so it's the "stale fd" branch, not "vanished".
+        monkeypatch.setattr("grbl_proxy.serial_conn.os.path.exists", lambda p: True)
+        monkeypatch.setattr(
+            "grbl_proxy.serial_conn.list_serial_candidates", lambda: ["/dev/ttyACM0"]
+        )
+
+        task = asyncio.create_task(conn.run_reconnect_loop())
+        await asyncio.sleep(1.3)
+        conn.signal_shutdown()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+        assert conn._serial is None      # leaked fd swept up
 
     async def test_vanished_node_closes_the_port_promptly(self, monkeypatch):
         """The fd must be dropped when the node disappears — holding it is what

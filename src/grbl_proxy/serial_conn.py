@@ -191,11 +191,17 @@ class SerialConnection:
                 await asyncio.to_thread(self._serial.write, data)
             except serial.SerialException as e:
                 logger.warning("Serial write error: %s", e)
-                self._connected.clear()
+                # CLOSE, don't merely mark disconnected. A write failure means
+                # the device is gone/broken; holding the fd open keeps its
+                # kernel node allocated, so the controller re-enumerates as
+                # ttyACM1 instead of reclaiming ttyACM0. (The read path already
+                # closes here — this one used to just clear _connected, which
+                # was the fd leak behind the renumbering.)
+                self.close_immediately()
                 raise SerialDisconnectedError(str(e)) from e
             except OSError as e:
                 logger.warning("Serial OS error on write: %s", e)
-                self._connected.clear()
+                self.close_immediately()
                 raise SerialDisconnectedError(str(e)) from e
 
     async def run_reconnect_loop(self) -> None:
@@ -218,18 +224,26 @@ class SerialConnection:
         while not self._shutting_down:
             now = time.monotonic()
 
-            # Release the fd as soon as the node goes away, without waiting for
-            # a read/write to fail. Holding an fd on a departed USB CDC device
-            # keeps its minor number allocated, so the controller re-enumerates
-            # as ttyACM1 rather than reclaiming ttyACM0 — and an auto-detect
-            # path pinned at boot would then never find it again.
-            if self._connected.is_set() and not os.path.exists(self._port):
-                logger.warning(
-                    "Serial device %s disappeared — closing port so its "
-                    "kernel node can be released",
-                    self._port,
-                )
-                self.close_immediately()
+            # Release any fd we shouldn't still be holding, so its kernel node
+            # is freed and the controller can reclaim ttyACM0 instead of
+            # re-enumerating as ttyACM1. Two cases, both checked on _serial (NOT
+            # _connected — an I/O error may have cleared _connected while leaving
+            # the fd open, which is exactly the leak that caused the renumber):
+            #   • the device node has physically disappeared, or
+            #   • we've been marked disconnected but the fd is still open.
+            if self._serial is not None:
+                if not os.path.exists(self._port):
+                    logger.warning(
+                        "Serial device %s disappeared — releasing its kernel node",
+                        self._port,
+                    )
+                    self.close_immediately()
+                elif not self._connected.is_set():
+                    logger.debug(
+                        "Releasing stale serial fd on %s after an I/O failure",
+                        self._port,
+                    )
+                    self.close_immediately()
 
             if not self._connected.is_set():
                 self._rescan_port()
