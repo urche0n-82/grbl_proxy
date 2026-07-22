@@ -11,6 +11,7 @@ is not closed on a client disconnect).
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 
 import pytest
@@ -124,6 +125,36 @@ class TestPortRecovery:
         )
         conn._rescan_port()
         assert conn.port == "/dev/grbl-laser"
+
+    def test_boot_window_failure_is_quiet_and_fast_retry(self, caplog):
+        """A failure just after opening is the controller still booting: logged
+        at DEBUG (not WARNING) and scheduled for a quick retry."""
+        import time as _time
+        conn = self._auto_conn()
+        conn._opened_at = _time.monotonic()  # opened just now
+        conn._config.reconnect_interval = 5.0
+
+        with caplog.at_level(logging.DEBUG, logger="grbl_proxy.serial_conn"):
+            conn._note_io_failure("write", Exception("[Errno 5] I/O error"))
+
+        assert "still" in caplog.text and "booting" in caplog.text
+        assert not any(r.levelno >= logging.WARNING for r in caplog.records)
+        # Retry within ~BOOT_RETRY_INTERVAL, well before reconnect_interval.
+        assert conn._next_attempt - _time.monotonic() < 2.0
+
+    def test_late_failure_is_a_warning_and_slow_retry(self, caplog):
+        """A failure long after opening is a genuine fault: WARNING, and retried
+        at the normal interval."""
+        import time as _time
+        conn = self._auto_conn()
+        conn._opened_at = _time.monotonic() - 30.0  # opened well outside the window
+        conn._config.reconnect_interval = 5.0
+
+        with caplog.at_level(logging.DEBUG, logger="grbl_proxy.serial_conn"):
+            conn._note_io_failure("read", Exception("device disconnected"))
+
+        assert any(r.levelno >= logging.WARNING for r in caplog.records)
+        assert conn._next_attempt - _time.monotonic() > 3.0
 
     async def test_write_error_releases_the_fd(self):
         """A failed write must CLOSE the port, not merely mark it disconnected.

@@ -35,6 +35,14 @@ PORT_MONITOR_INTERVAL = 1.0
 # worse, pins the minor number so the board returns as ttyACM1.
 PORT_SETTLE_SECONDS = 2.0
 
+# A read/write failure within this long after a successful open is treated as
+# the controller still finishing its boot (it enumerates, and even accepts an
+# open(), before it can actually talk) rather than a real fault. Such failures
+# are logged quietly and retried quickly instead of after the full
+# reconnect_interval, since the device is about to become ready.
+BOOT_WINDOW_SECONDS = 3.0
+BOOT_RETRY_INTERVAL = 1.0
+
 READLINE_TIMEOUT = 1.0  # seconds — allows reconnection detection loop to tick
 
 
@@ -60,6 +68,12 @@ class SerialConnection:
         # When the current device node was first seen present (monotonic), used
         # to let it settle before opening. None = not currently present.
         self._port_first_seen: float | None = None
+        # Monotonic time of the last successful open, so a failure can be judged
+        # against the boot window. Earliest monotonic time the reconnect loop may
+        # attempt the next open — a boot-window failure pulls this in for a fast
+        # retry; a real fault leaves it at reconnect_interval.
+        self._opened_at = 0.0
+        self._next_attempt = 0.0
         self._serial: serial.Serial | None = None
         self._write_lock = asyncio.Lock()
         # Serializes reads: at most one readline() worker thread may touch the
@@ -97,6 +111,26 @@ class SerialConnection:
         """Close the serial port cleanly."""
         self._shutting_down = True
         self.close_immediately()
+
+    def _note_io_failure(self, kind: str, exc: Exception) -> None:
+        """Classify a read/write failure for logging and retry pacing.
+
+        A failure that lands within BOOT_WINDOW_SECONDS of opening is the
+        controller still coming up (it enumerates and accepts open() before it
+        can talk): logged at DEBUG as a normal power-on step, and the next open
+        is scheduled soon so we catch it the moment it's ready. Anything later is
+        a genuine fault: logged at WARNING and retried at the normal interval.
+        """
+        since_open = time.monotonic() - self._opened_at
+        if 0 <= since_open < BOOT_WINDOW_SECONDS:
+            logger.debug(
+                "Serial %s failed %.2fs after opening — controller still "
+                "booting, will retry shortly: %s", kind, since_open, exc,
+            )
+            self._next_attempt = time.monotonic() + BOOT_RETRY_INTERVAL
+        else:
+            logger.warning("Serial %s error: %s", kind, exc)
+            self._next_attempt = time.monotonic() + self._config.reconnect_interval
 
     def close_immediately(self) -> None:
         """Close the serial port synchronously from any thread or coroutine.
@@ -161,12 +195,8 @@ class SerialConnection:
                 except asyncio.CancelledError:
                     await asyncio.gather(fut, return_exceptions=True)
                     raise
-                except serial.SerialException as e:
-                    logger.warning("Serial read error: %s", e)
-                    self.close_immediately()
-                    raise SerialDisconnectedError(str(e)) from e
-                except OSError as e:
-                    logger.warning("Serial OS error on read: %s", e)
+                except (serial.SerialException, OSError) as e:
+                    self._note_io_failure("read", e)
                     self.close_immediately()
                     raise SerialDisconnectedError(str(e)) from e
 
@@ -189,18 +219,14 @@ class SerialConnection:
         async with self._write_lock:
             try:
                 await asyncio.to_thread(self._serial.write, data)
-            except serial.SerialException as e:
-                logger.warning("Serial write error: %s", e)
+            except (serial.SerialException, OSError) as e:
                 # CLOSE, don't merely mark disconnected. A write failure means
                 # the device is gone/broken; holding the fd open keeps its
                 # kernel node allocated, so the controller re-enumerates as
                 # ttyACM1 instead of reclaiming ttyACM0. (The read path already
                 # closes here — this one used to just clear _connected, which
                 # was the fd leak behind the renumbering.)
-                self.close_immediately()
-                raise SerialDisconnectedError(str(e)) from e
-            except OSError as e:
-                logger.warning("Serial OS error on write: %s", e)
+                self._note_io_failure("write", e)
                 self.close_immediately()
                 raise SerialDisconnectedError(str(e)) from e
 
@@ -220,7 +246,6 @@ class SerialConnection:
         config.reconnect_interval. The fast tick exists to drop the fd promptly
         when a device node vanishes; the slow retry avoids hammering open().
         """
-        next_attempt = 0.0
         while not self._shutting_down:
             now = time.monotonic()
 
@@ -263,9 +288,12 @@ class SerialConnection:
                         )
                     elif (
                         now - self._port_first_seen >= PORT_SETTLE_SECONDS
-                        and now >= next_attempt
+                        and now >= self._next_attempt
                     ):
-                        next_attempt = now + self._config.reconnect_interval
+                        # Default throttle in case the open() itself fails; a
+                        # boot-window I/O failure after a successful open pulls
+                        # _next_attempt back in via _note_io_failure.
+                        self._next_attempt = now + self._config.reconnect_interval
                         logger.info(
                             "Attempting serial reconnect to %s ...", self._port
                         )
@@ -349,4 +377,5 @@ class SerialConnection:
             ) from e
 
         self._serial = s
+        self._opened_at = time.monotonic()  # baseline for boot-window failures
         logger.info("Serial port %s opened at %d baud", self._port, self._config.baud)
