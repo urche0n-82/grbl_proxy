@@ -14,6 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import socket
+import time
 
 from grbl_proxy import grbl_protocol
 from grbl_proxy.serial_conn import SerialDisconnectedError
@@ -22,6 +23,14 @@ logger = logging.getLogger(__name__)
 
 # Max seconds to wait for GRBL's reboot banner after a soft-reset-on-connect.
 RESET_BANNER_TIMEOUT = 3.0
+
+# In Passthrough, if the proxy has pushed a command to GRBL and then read
+# nothing back for this long, the controller has almost certainly stalled
+# mid-command. This is longer than any legitimate ok-hold observed on real
+# frames (~9s while a move drains the planner), so it fires only on a genuine
+# hang — surfacing it ONCE, with proof the read loop is still alive, so a
+# controller-side halt can be told apart from a proxy-side read wedge.
+PASSTHROUGH_STALL_WARN_S = 15.0
 
 # Avoid a circular import: proxy_core imports grbl_protocol but not tcp_server.
 # Import ProxyCore lazily via TYPE_CHECKING so it's available for type hints
@@ -335,6 +344,10 @@ class TcpServer:
     ) -> None:
         """Forward lines from GRBL (serial) back to LightBurn (TCP)."""
         serial_was_connected = self._serial.is_connected
+        # Passthrough stall watchdog state (see PASSTHROUGH_STALL_WARN_S).
+        last_real_read = time.monotonic()
+        silent_ticks = 0
+        stall_warned = False
         while not stop_relay.is_set():
             # During EXECUTING the GrblStreamer owns the serial read path.
             # Wait here until the streamer releases it (serial_readable is set).
@@ -447,15 +460,36 @@ class TcpServer:
 
             if not line:
                 # Timeout tick from read_line — no data within READLINE_TIMEOUT.
-                # Not logged: an idle machine produces one of these every second,
-                # which drowns the debug log. (This tick was temporarily logged
-                # to prove the read loop stayed alive during a passthrough
-                # freeze; that turned out to be a firmware write-interleave,
-                # fixed in grbl_protocol.split_responses.)
+                # Not logged per-tick: an idle machine produces one of these
+                # every second, which drowns the debug log. Instead the stall
+                # watchdog below emits ONE line when silence-after-a-write runs
+                # long, which is the only interesting case.
                 serial_was_connected = True  # read succeeded, serial is live
+                if self._proxy is not None and self._proxy.state.value == "Passthrough":
+                    lw = self._serial.last_write_at
+                    now = time.monotonic()
+                    # Only meaningful if we've written since our last real read:
+                    # then a command is outstanding and GRBL owes us a response.
+                    if lw > last_real_read:
+                        silent_ticks += 1
+                        if not stall_warned and now - lw >= PASSTHROUGH_STALL_WARN_S:
+                            logger.warning(
+                                "Passthrough stall: serial silent %.1fs after last "
+                                "write while a client is connected (read loop ALIVE, "
+                                "%d timeout ticks). rx_buf=%r last_status=%s. GRBL "
+                                "appears to have stopped responding mid-command.",
+                                now - lw,
+                                silent_ticks,
+                                self._serial.rx_pending,
+                                self._proxy.last_status,
+                            )
+                            stall_warned = True
                 continue
 
             serial_was_connected = True  # successful read confirms serial is live
+            last_real_read = time.monotonic()
+            silent_ticks = 0
+            stall_warned = False
 
             # One serial line can carry more than one protocol message when the
             # firmware interleaves a realtime status report with an ok/error

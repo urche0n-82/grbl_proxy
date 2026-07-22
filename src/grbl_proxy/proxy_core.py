@@ -429,6 +429,11 @@ class ProxyCore:
         return self._state
 
     @property
+    def last_status(self) -> StatusReport | None:
+        """Most recent GRBL status report seen (for diagnostics/synthetic replies)."""
+        return self._last_status
+
+    @property
     def serial_readable(self) -> asyncio.Event:
         """Event that is set when _serial_to_tcp may read from serial.
 

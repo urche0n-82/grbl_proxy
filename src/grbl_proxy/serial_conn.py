@@ -74,6 +74,10 @@ class SerialConnection:
         # retry; a real fault leaves it at reconnect_interval.
         self._opened_at = 0.0
         self._next_attempt = 0.0
+        # Monotonic time of the last write toward GRBL. Lets the passthrough
+        # relay tell an idle link (nothing outstanding) from a stall (we sent a
+        # command and the controller went silent). 0.0 = nothing written yet.
+        self.last_write_at = 0.0
         self._serial: serial.Serial | None = None
         self._write_lock = asyncio.Lock()
         # Serializes reads: at most one readline() worker thread may touch the
@@ -217,6 +221,10 @@ class SerialConnection:
             raise SerialDisconnectedError("Serial port not open")
 
         async with self._write_lock:
+            # Timestamp every push toward GRBL so the passthrough relay's stall
+            # watchdog can distinguish a legitimately-quiet link from a
+            # controller that went silent after we sent it a command.
+            self.last_write_at = time.monotonic()
             try:
                 await asyncio.to_thread(self._serial.write, data)
             except (serial.SerialException, OSError) as e:
@@ -338,6 +346,11 @@ class SerialConnection:
     @property
     def is_connected(self) -> bool:
         return self._connected.is_set()
+
+    @property
+    def rx_pending(self) -> bytes:
+        """Bytes received but not yet emitted as a complete line (diagnostics)."""
+        return bytes(self._rx_buf)
 
     @property
     def port(self) -> str:

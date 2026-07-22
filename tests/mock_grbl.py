@@ -25,6 +25,10 @@ class MockSerialConnection:
         self.tx_log: list[bytes] = []  # all bytes written to "serial"
         self._connected = True
         self._auto_respond = auto_respond
+        # Mirror the real SerialConnection surface the passthrough stall
+        # watchdog reads on every timeout tick.
+        self.last_write_at = 0.0
+        self._rx_buf = bytearray()
 
     # --- SerialConnection interface ---
 
@@ -40,6 +44,10 @@ class MockSerialConnection:
     @property
     def is_connected(self) -> bool:
         return self._connected
+
+    @property
+    def rx_pending(self) -> bytes:
+        return bytes(self._rx_buf)
 
     async def read_line(self) -> str:
         """Return the next line from the receive queue, or "" on timeout.
@@ -57,6 +65,8 @@ class MockSerialConnection:
     async def write(self, data: bytes) -> None:
         """Accept bytes from the TCP relay and optionally auto-respond."""
         self.tx_log.append(data)
+        import time
+        self.last_write_at = time.monotonic()
 
         if not self._auto_respond:
             return

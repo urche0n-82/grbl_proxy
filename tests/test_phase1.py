@@ -487,3 +487,90 @@ class TestShutdownWithClientConnected:
             writer.close()
         except Exception:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Passthrough stall watchdog
+#
+# Regression / diagnostic guard: when GRBL stops responding mid-command in
+# Passthrough (observed on hardware — a frame that acked 3 of 11 lines then
+# went silent), the relay's read loop keeps ticking on READLINE_TIMEOUT with
+# nothing to forward. The watchdog must surface that ONCE, with proof the read
+# loop is alive, so a controller-side halt is distinguishable from a proxy
+# read-path wedge. It must NOT fire on a merely-idle link (nothing written).
+# ---------------------------------------------------------------------------
+
+
+class TestPassthroughStallWatchdog:
+    async def test_warns_once_when_grbl_goes_silent_after_a_write(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        import grbl_proxy.tcp_server as tcp_server_mod
+
+        # Shrink the threshold so a single post-write timeout tick trips it.
+        monkeypatch.setattr(tcp_server_mod, "PASSTHROUGH_STALL_WARN_S", 0.0)
+
+        cfg = JobConfig(
+            storage_dir=str(tmp_path / "jobs"),
+            auto_detect=AutoDetectConfig(enabled=False),
+        )
+        # auto_respond=False → the mock never acks: GRBL "goes silent".
+        mock = MockSerialConnection(auto_respond=False)
+        core = ProxyCore(cfg, idle_timeout_s=5.0)
+        server = TcpServer("127.0.0.1", _BASE_PORT + 20, mock, proxy_core=core)
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 20)
+            # Push a command toward GRBL — stamps last_write_at. No ok comes back.
+            writer.write(b"G0 X1\n")
+            await writer.drain()
+
+            with caplog.at_level(logging.WARNING, logger="grbl_proxy.tcp_server"):
+                # Wait past a couple of 1s readline timeout ticks.
+                await asyncio.sleep(2.3)
+
+            stalls = [
+                r for r in caplog.records if "Passthrough stall" in r.getMessage()
+            ]
+            assert len(stalls) == 1, f"expected exactly one stall warning, got {len(stalls)}"
+            assert "read loop ALIVE" in stalls[0].getMessage()
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
+
+    async def test_no_warning_when_idle_with_nothing_written(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        import logging
+
+        import grbl_proxy.tcp_server as tcp_server_mod
+
+        monkeypatch.setattr(tcp_server_mod, "PASSTHROUGH_STALL_WARN_S", 0.0)
+
+        cfg = JobConfig(
+            storage_dir=str(tmp_path / "jobs"),
+            auto_detect=AutoDetectConfig(enabled=False),
+        )
+        mock = MockSerialConnection(auto_respond=False)
+        core = ProxyCore(cfg, idle_timeout_s=5.0)
+        server = TcpServer("127.0.0.1", _BASE_PORT + 21, mock, proxy_core=core)
+        await server.start()
+        try:
+            reader, writer = await _connect(_BASE_PORT + 21)
+            # Connect but send nothing — the link is idle, not stalled.
+            with caplog.at_level(logging.WARNING, logger="grbl_proxy.tcp_server"):
+                await asyncio.sleep(2.3)
+
+            stalls = [
+                r for r in caplog.records if "Passthrough stall" in r.getMessage()
+            ]
+            assert stalls == [], "watchdog must not fire on an idle link"
+
+            writer.close()
+            await writer.wait_closed()
+        finally:
+            await server.stop()
