@@ -574,3 +574,64 @@ class TestPassthroughStallWatchdog:
             await writer.wait_closed()
         finally:
             await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Passthrough write coalescing
+#
+# A command burst that LightBurn delivers in one TCP chunk must reach GRBL as a
+# SINGLE contiguous serial write, not one write per line. Per-line writes space
+# commands out enough to shift GRBL's execution timing (observed as the laser
+# module's airflow spin-up window collapsing after M3 on the Falcon 2), a
+# difference a direct serial connection never exhibits.
+# ---------------------------------------------------------------------------
+
+
+class _NullWriter:
+    """Minimal StreamWriter stand-in for _route_bytes unit tests."""
+
+    def write(self, data: bytes) -> None:  # noqa: D401
+        pass
+
+    async def drain(self) -> None:
+        pass
+
+
+class TestPassthroughWriteCoalescing:
+    async def test_burst_becomes_single_serial_write(self, tmp_path):
+        cfg = JobConfig(
+            storage_dir=str(tmp_path / "jobs"),
+            auto_detect=AutoDetectConfig(enabled=False),
+        )
+        mock = MockSerialConnection(auto_respond=False)
+        core = ProxyCore(cfg, idle_timeout_s=5.0)
+        core.on_client_connected()  # Disconnected → Passthrough
+        server = TcpServer("127.0.0.1", _BASE_PORT + 22, mock, proxy_core=core)
+
+        # One TCP chunk carrying a multi-line frame-style burst, including an
+        # inline "?" realtime query (GRBL plucks it; it must still coalesce).
+        burst = b"G0 X95Y92\nM3\nG1 Y304S10F6000\n?\nG1 X287\n"
+        await server._route_bytes(burst, _NullWriter())
+
+        # Exactly one serial write, and it carries every forwarded byte in order.
+        assert len(mock.tx_log) == 1, f"expected 1 coalesced write, got {len(mock.tx_log)}"
+        assert mock.tx_log[0] == b"G0 X95Y92\nM3\nG1 Y304S10F6000\n?\nG1 X287\n"
+
+    async def test_partial_trailing_line_is_held_until_terminated(self, tmp_path):
+        cfg = JobConfig(
+            storage_dir=str(tmp_path / "jobs"),
+            auto_detect=AutoDetectConfig(enabled=False),
+        )
+        mock = MockSerialConnection(auto_respond=False)
+        core = ProxyCore(cfg, idle_timeout_s=5.0)
+        core.on_client_connected()
+        server = TcpServer("127.0.0.1", _BASE_PORT + 23, mock, proxy_core=core)
+
+        # First chunk ends mid-line: only the complete line flushes; the tail
+        # stays buffered (a partial line must never be written to GRBL).
+        await server._route_bytes(b"G0 X1\nG1 X2", _NullWriter())
+        assert mock.tx_log == [b"G0 X1\n"]
+
+        # Second chunk completes the held line.
+        await server._route_bytes(b"3\n", _NullWriter())
+        assert mock.tx_log == [b"G0 X1\n", b"G1 X23\n"]

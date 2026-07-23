@@ -316,10 +316,19 @@ class TcpServer:
             stop_relay.set()
 
     async def _route_bytes(self, data: bytes, writer: asyncio.StreamWriter) -> None:
-        """Process incoming bytes through ProxyCore, assembling lines."""
+        """Process incoming bytes through ProxyCore, assembling lines.
+
+        Everything this TCP chunk forwards to GRBL is accumulated in `sink` and
+        flushed in a SINGLE serial write at the end, so a command burst reaches
+        the controller as one contiguous stream — matching a direct serial
+        connection. Writing each line separately spaced commands out enough to
+        shift GRBL's execution timing (e.g. collapsing the laser module's airflow
+        spin-up window after M3), a difference a direct connection never has.
+        """
+        sink = bytearray()
         for byte in data:
             # Check for real-time commands before adding to line buffer
-            consumed = await self._proxy.process_raw_byte(byte, writer, self._serial)
+            consumed = await self._proxy.process_raw_byte(byte, writer, self._serial, sink)
             if consumed:
                 continue
 
@@ -334,10 +343,13 @@ class TcpServer:
                 # leaving an empty line whose "ok" LightBurn waits for before
                 # sending its next command. Dropping it here stalls the client.
                 logger.debug("Route [%s]: %r", self._proxy.state.value, line)
-                try:
-                    await self._proxy.process_client_line(line, writer, self._serial)
-                except SerialDisconnectedError as e:
-                    logger.warning("Serial unavailable during routing: %s", e)
+                await self._proxy.process_client_line(line, writer, self._serial, sink)
+
+        if sink:
+            try:
+                await self._serial.write(bytes(sink))
+            except SerialDisconnectedError as e:
+                logger.warning("Serial unavailable during routing: %s", e)
 
     async def _serial_to_tcp(
         self, writer: asyncio.StreamWriter, stop_relay: asyncio.Event

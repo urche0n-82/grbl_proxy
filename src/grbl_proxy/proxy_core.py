@@ -225,11 +225,20 @@ class ProxyCore:
         byte: int,
         writer: asyncio.StreamWriter,
         serial_conn,
+        sink: bytearray | None = None,
     ) -> bool:
         """Intercept a single byte before line assembly.
 
         Returns True if the byte was consumed and should NOT be added to the
         line buffer. Must be called for every incoming byte.
+
+        When `sink` is provided, bytes that would be forwarded to GRBL in the
+        normal relay path are appended to it instead of being written
+        individually, so the caller can flush a whole TCP chunk to serial in one
+        contiguous write (matching a direct connection's timing). Realtime
+        control bytes handled specially mid-job (feed hold/resume/soft reset)
+        still write immediately — their latency matters and they are not part of
+        the coalesced stream.
         """
         # Cache serial_conn reference for use by the streamer
         self._serial_conn = serial_conn
@@ -250,12 +259,16 @@ class ProxyCore:
                 writer.write(response.encode())
                 await writer.drain()
             else:
-                # Passthrough: forward to serial
-                try:
-                    await serial_conn.write(bytes([byte]))
-                    logger.debug("TCP→Serial realtime: b'?' (state=%s)", self._state.value)
-                except Exception as e:
-                    logger.debug("Serial unavailable for realtime '?': %s", e)
+                # Passthrough: forward to serial (coalesced into the chunk's
+                # single write when a sink is provided — see _route_bytes).
+                if sink is not None:
+                    sink += bytes([byte])
+                else:
+                    try:
+                        await serial_conn.write(bytes([byte]))
+                    except Exception as e:
+                        logger.debug("Serial unavailable for realtime '?': %s", e)
+                logger.debug("TCP→Serial realtime: b'?' (state=%s)", self._state.value)
             return True
 
         # Feed hold (!), cycle resume (~), soft reset (Ctrl-X) during buffering
@@ -312,12 +325,16 @@ class ProxyCore:
                 logger.debug("Serial write error for soft reset: %s", e)
             return True
 
-        # Forward the command to serial regardless (BUFFERING path, PASSTHROUGH, etc.)
-        try:
-            await serial_conn.write(bytes([byte]))
-            logger.debug("TCP→Serial realtime: 0x%02x (state=%s)", byte, self._state.value)
-        except Exception as e:
-            logger.debug("Serial unavailable for realtime command: %s", e)
+        # Forward the command to serial (BUFFERING path, PASSTHROUGH, etc.),
+        # coalesced into the chunk's single write when a sink is provided.
+        if sink is not None:
+            sink += bytes([byte])
+        else:
+            try:
+                await serial_conn.write(bytes([byte]))
+            except Exception as e:
+                logger.debug("Serial unavailable for realtime command: %s", e)
+        logger.debug("TCP→Serial realtime: 0x%02x (state=%s)", byte, self._state.value)
         return True
 
     async def process_client_line(
@@ -325,6 +342,7 @@ class ProxyCore:
         line: str,
         writer: asyncio.StreamWriter,
         serial_conn,
+        sink: bytearray | None = None,
     ) -> None:
         """Route a complete decoded line from LightBurn.
 
@@ -342,6 +360,11 @@ class ProxyCore:
         if self._state == ProxyState.PASSTHROUGH:
             if self._check_job_start(line):
                 await self._enter_buffering(writer)
+            elif sink is not None:
+                # Coalesce into the chunk's single serial write (see _route_bytes)
+                # so a command burst reaches GRBL contiguously, the way a direct
+                # serial connection delivers it.
+                sink += (line + "\n").encode()
             else:
                 try:
                     await serial_conn.write((line + "\n").encode())
