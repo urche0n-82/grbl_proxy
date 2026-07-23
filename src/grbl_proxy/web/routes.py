@@ -131,6 +131,9 @@ def create_router() -> APIRouter:
                 (storage_dir / "uploaded.filename").write_text(
                     original_filename, encoding="utf-8"
                 )
+            # A fresh upload becomes the selected job, superseding any prior
+            # selection (the server-side record /api/job/start falls back to).
+            (storage_dir / "selected.stem").write_text("uploaded", encoding="utf-8")
             return content.count(b"\n")
 
         line_count = await asyncio.to_thread(_write)
@@ -141,9 +144,12 @@ def create_router() -> APIRouter:
         cfg = _config(request)
         storage_dir = Path(cfg.job.storage_dir).expanduser()
 
-        # An optional {"stem": ...} body selects an already-stored job to re-run
-        # in place. Its absence (or stem == "uploaded") means run the freshly
-        # uploaded file, which is archived under a permanent name exactly once.
+        # Which job to run is identified by a stem. Prefer the {"stem": ...}
+        # request body, but fall back to the server-side selection recorded by
+        # /api/files/{stem}/select. The fallback matters: a browser running a
+        # cached older app.js sends no body, and without it Run would wrongly
+        # take the upload path and fail with "No uploaded file found".
+        selected_ptr = storage_dir / "selected.stem"
         stem = None
         try:
             body = await request.json()
@@ -151,11 +157,17 @@ def create_router() -> APIRouter:
                 stem = body.get("stem")
         except Exception:
             pass
+        if not stem and selected_ptr.exists():
+            try:
+                stem = selected_ptr.read_text(encoding="utf-8").strip() or None
+            except Exception:
+                stem = None
 
         if stem and stem != "uploaded":
             ok, reason = await _control(request).start_existing_job(
                 storage_dir, stem, max_history=cfg.job.max_history
             )
+            selected_ptr.unlink(missing_ok=True)  # selection consumed
             if not ok:
                 raise HTTPException(status_code=409, detail=reason)
             return {"ok": True}
@@ -181,6 +193,7 @@ def create_router() -> APIRouter:
                 sidecar.unlink()
             except Exception:
                 pass
+        selected_ptr.unlink(missing_ok=True)  # selection consumed
         return {"ok": True}
 
     @router.post("/api/job/pause")
@@ -307,6 +320,13 @@ def create_router() -> APIRouter:
             (storage_dir / f"{stem}.meta.json").unlink(missing_ok=True)
             if stem == "uploaded":
                 (storage_dir / "uploaded.filename").unlink(missing_ok=True)
+            # Drop a dangling selection pointing at the file just removed.
+            ptr = storage_dir / "selected.stem"
+            try:
+                if ptr.exists() and ptr.read_text(encoding="utf-8").strip() == stem:
+                    ptr.unlink(missing_ok=True)
+            except Exception:
+                pass
 
         await asyncio.to_thread(_delete)
         return {"ok": True}
@@ -327,7 +347,10 @@ def create_router() -> APIRouter:
         if not src.exists():
             raise HTTPException(status_code=404, detail="File not found")
 
-        def _display_name():
+        def _select():
+            # Record the selection server-side so /api/job/start can run this
+            # stem even if the client (e.g. a cached older app.js) sends no body.
+            (storage_dir / "selected.stem").write_text(stem, encoding="utf-8")
             sidecar = storage_dir / "uploaded.filename"
             if stem == "uploaded" and sidecar.exists():
                 try:
@@ -344,7 +367,7 @@ def create_router() -> APIRouter:
                     pass
             return stem
 
-        display_name = await asyncio.to_thread(_display_name)
+        display_name = await asyncio.to_thread(_select)
         return {"ok": True, "display_name": display_name}
 
     @router.get("/api/webcam")

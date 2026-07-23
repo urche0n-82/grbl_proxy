@@ -610,3 +610,36 @@ async def test_rerun_missing_file_409(tmp_path):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.post("/api/job/start", json={"stem": "does_not_exist"})
     assert resp.status_code == 409
+
+
+async def test_select_then_run_without_body_uses_server_pointer(tmp_path):
+    """Regression: a cached older app.js sends no stem on Run. The selection
+    recorded by /select must still drive the in-place re-run (not the upload
+    path), so Run doesn't fail with 'No uploaded file found'."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+    core._state = ProxyState.PASSTHROUGH
+    serial = _make_serial()
+    (tmp_path / "art.gcode").write_text("G0\nG1 X1\nM2\n")
+    (tmp_path / "art.meta.json").write_text(json.dumps({"original_filename": "art.nc"}))
+
+    status = ProxyStatus(core, serial_conn=serial)
+    control = ProxyControl(core, serial_conn=serial)
+    console = ConsoleLog()
+    cfg = _make_config(tmp_path)
+
+    with patch.object(core, "_start_streamer") as mock_start:
+        app = create_app(status, control, console, cfg)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            sel = await c.post("/api/files/art/select")
+            assert sel.status_code == 200
+            assert (tmp_path / "selected.stem").read_text() == "art"
+            # No JSON body — mimics the stale cached frontend.
+            resp = await c.post("/api/job/start")
+
+    assert resp.status_code == 200
+    mock_start.assert_called_once()
+    assert mock_start.call_args[0][0].path == tmp_path / "art.gcode"
+    # Pointer consumed; no duplicate created.
+    assert not (tmp_path / "selected.stem").exists()
+    assert sorted(p.name for p in tmp_path.glob("*.gcode")) == ["art.gcode"]
