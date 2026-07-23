@@ -274,6 +274,82 @@ class ProxyControl:
         except Exception as e:
             logger.warning("Could not write meta.json for upload job: %s", e)
 
+        await self._begin_execution(serial, meta)
+        logger.info("Web-initiated job started: %s (%d lines)", archived_path, line_count)
+        return True, "ok"
+
+    async def start_existing_job(
+        self, storage_dir, stem: str, max_history: int = 20
+    ) -> tuple[bool, str]:
+        """Re-run an already-stored job in place, WITHOUT duplicating it.
+
+        Selecting a file from the Files list and running it used to copy it to
+        uploaded.gcode and then archive that copy under a new timestamped name,
+        so every re-run left another identical file behind. This streams the
+        existing {stem}.gcode directly — no copy, no re-archive, no history
+        rotation — so the stored file count stays stable across repeated runs.
+        """
+        from grbl_proxy.proxy_core import ProxyState
+        from grbl_proxy.job_buffer import JobMetadata
+        import time as _time
+        import json as _json
+        from pathlib import Path as _Path
+
+        core = self._core
+        serial = self._serial_conn()
+
+        if core._state not in (ProxyState.PASSTHROUGH, ProxyState.DISCONNECTED):
+            return False, f"Cannot start job in state {core._state.value}"
+        if serial is None or not serial.is_connected:
+            return False, "Serial port not connected"
+
+        storage_dir = _Path(storage_dir).expanduser()
+        gcode_path = storage_dir / f"{stem}.gcode"
+        if not gcode_path.exists():
+            return False, "File not found"
+
+        try:
+            line_count = sum(1 for _ in gcode_path.open(encoding="utf-8"))
+        except Exception as e:
+            return False, f"Cannot read file: {e}"
+
+        # Recover the friendly name from the stored metadata, if present. The
+        # on-disk meta.json is left untouched — we neither rewrite nor rotate it.
+        original_filename = None
+        meta_path = storage_dir / f"{stem}.meta.json"
+        if meta_path.exists():
+            try:
+                original_filename = _json.loads(
+                    meta_path.read_text(encoding="utf-8")
+                ).get("original_filename")
+            except Exception:
+                pass
+
+        start_time = _time.time()
+        meta = JobMetadata(
+            path=gcode_path,
+            line_count=line_count,
+            start_time=start_time,
+            end_time=start_time,
+            duration_s=0.0,
+            source="rerun",
+            original_filename=original_filename,
+        )
+
+        await self._begin_execution(serial, meta)
+        logger.info("Web re-run of stored job: %s (%d lines)", gcode_path, line_count)
+        return True, "ok"
+
+    async def _begin_execution(self, serial, meta) -> None:
+        """Hand the serial read path to the streamer and launch it.
+
+        Shared by the fresh-upload and re-run paths: wire the serial connection
+        into the core, transition to EXECUTING, and wait (briefly) for
+        _serial_to_tcp to release the read path before the streamer starts.
+        """
+        from grbl_proxy.proxy_core import ProxyState
+
+        core = self._core
         # Wire serial_conn into core so _start_streamer can use it
         if core._serial_conn is None:
             core._serial_conn = serial
@@ -288,9 +364,6 @@ class ProxyControl:
             pass
         core._serial_yield.clear()
         core._start_streamer(meta)
-
-        logger.info("Web-initiated job started: %s (%d lines)", archived_path, line_count)
-        return True, "ok"
 
     async def send_console(self, command: str) -> tuple[bool, str]:
         """Send an arbitrary command to GRBL. Valid in DISCONNECTED, or in

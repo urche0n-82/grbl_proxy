@@ -508,3 +508,105 @@ async def test_download_job_not_found(tmp_path):
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
         resp = await c.get("/api/jobs/99991231_999999/download")
     assert resp.status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# Re-running a stored file must NOT duplicate it
+# ---------------------------------------------------------------------------
+
+
+async def test_rerun_existing_file_does_not_duplicate(tmp_path):
+    """POST /api/job/start {stem} streams the stored file in place — no new file."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+    core._state = ProxyState.PASSTHROUGH
+    serial = _make_serial()
+
+    # A previously stored job (as start_uploaded_job would have left it).
+    (tmp_path / "my_design.gcode").write_text("G0 X10\nG1 X20\nM2\n")
+    (tmp_path / "my_design.meta.json").write_text(
+        json.dumps({"original_filename": "my_design.gcode", "source": "upload"})
+    )
+
+    status = ProxyStatus(core, serial_conn=serial)
+    control = ProxyControl(core, serial_conn=serial)
+    console = ConsoleLog()
+    cfg = _make_config(tmp_path)
+
+    before = sorted(p.name for p in tmp_path.glob("*.gcode"))
+
+    with patch.object(core, "_start_streamer") as mock_start:
+        app = create_app(status, control, console, cfg)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            resp = await c.post("/api/job/start", json={"stem": "my_design"})
+
+    assert resp.status_code == 200
+    assert resp.json()["ok"] is True
+
+    # No new .gcode file was created, and the original is untouched.
+    after = sorted(p.name for p in tmp_path.glob("*.gcode"))
+    assert after == before == ["my_design.gcode"]
+    assert not (tmp_path / "uploaded.gcode").exists()
+
+    # The streamer runs the canonical stored file directly.
+    mock_start.assert_called_once()
+    meta: JobMetadata = mock_start.call_args[0][0]
+    assert meta.path == tmp_path / "my_design.gcode"
+    assert meta.line_count == 3
+    assert meta.source == "rerun"
+
+
+async def test_rerun_repeated_keeps_file_count_stable(tmp_path):
+    """Running the same stored file several times never accumulates copies."""
+    job_cfg = JobConfig(storage_dir=str(tmp_path))
+    core = ProxyCore(job_cfg, idle_timeout_s=0.1)
+    serial = _make_serial()
+    (tmp_path / "art.gcode").write_text("G0\nM2\n")
+
+    status = ProxyStatus(core, serial_conn=serial)
+    control = ProxyControl(core, serial_conn=serial)
+    console = ConsoleLog()
+    cfg = _make_config(tmp_path)
+
+    with patch.object(core, "_start_streamer"):
+        app = create_app(status, control, console, cfg)
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            for _ in range(3):
+                core._state = ProxyState.PASSTHROUGH  # reset (mock streamer never finishes)
+                resp = await c.post("/api/job/start", json={"stem": "art"})
+                assert resp.status_code == 200
+
+    assert sorted(p.name for p in tmp_path.glob("*.gcode")) == ["art.gcode"]
+
+
+async def test_select_existing_file_makes_no_copy(tmp_path):
+    """Selecting a stored file resolves its name without copying to uploaded.gcode."""
+    core = _make_mock_core(ProxyState.PASSTHROUGH)
+    serial = _make_serial()
+    (tmp_path / "art.gcode").write_text("G0\nM2\n")
+    (tmp_path / "art.meta.json").write_text(json.dumps({"original_filename": "art.nc"}))
+
+    status = ProxyStatus(core, serial_conn=serial)
+    control = ProxyControl(core, serial_conn=serial)
+    console = ConsoleLog()
+    cfg = _make_config(tmp_path)
+    app = create_app(status, control, console, cfg)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post("/api/files/art/select")
+
+    assert resp.status_code == 200
+    assert resp.json()["display_name"] == "art.nc"
+    assert not (tmp_path / "uploaded.gcode").exists()
+
+
+async def test_rerun_missing_file_409(tmp_path):
+    core = _make_mock_core(ProxyState.PASSTHROUGH)
+    serial = _make_serial()
+    status = ProxyStatus(core, serial_conn=serial)
+    control = ProxyControl(core, serial_conn=serial)
+    console = ConsoleLog()
+    cfg = _make_config(tmp_path)
+    app = create_app(status, control, console, cfg)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+        resp = await c.post("/api/job/start", json={"stem": "does_not_exist"})
+    assert resp.status_code == 409

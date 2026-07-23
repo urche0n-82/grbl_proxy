@@ -269,7 +269,14 @@ $("console-log").addEventListener("scroll", (e) => {
 
 async function runQueued() {
   try {
-    const resp = await fetch("/api/job/start", { method: "POST" });
+    // Pass the selected stem so an existing stored file is re-run in place
+    // instead of being copied and re-archived as a duplicate. "uploaded"
+    // (a fresh drag-drop) falls through to the archive-once upload path.
+    const resp = await fetch("/api/job/start", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ stem: selectedFileStem }),
+    });
     if (resp.ok) {
       setJobStatus("Job started.");
       selectedFileStem = null;

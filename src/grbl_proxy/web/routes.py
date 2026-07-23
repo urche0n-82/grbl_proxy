@@ -140,7 +140,28 @@ def create_router() -> APIRouter:
     async def start_job(request: Request):
         cfg = _config(request)
         storage_dir = Path(cfg.job.storage_dir).expanduser()
-        # Try to recover original filename from a sidecar file
+
+        # An optional {"stem": ...} body selects an already-stored job to re-run
+        # in place. Its absence (or stem == "uploaded") means run the freshly
+        # uploaded file, which is archived under a permanent name exactly once.
+        stem = None
+        try:
+            body = await request.json()
+            if isinstance(body, dict):
+                stem = body.get("stem")
+        except Exception:
+            pass
+
+        if stem and stem != "uploaded":
+            ok, reason = await _control(request).start_existing_job(
+                storage_dir, stem, max_history=cfg.job.max_history
+            )
+            if not ok:
+                raise HTTPException(status_code=409, detail=reason)
+            return {"ok": True}
+
+        # Fresh-upload path: recover the original filename from the sidecar,
+        # archive uploaded.gcode, and run it.
         sidecar = storage_dir / "uploaded.filename"
         original_filename = None
         if sidecar.exists():
@@ -292,24 +313,21 @@ def create_router() -> APIRouter:
 
     @router.post("/api/files/{stem}/select")
     async def select_file(request: Request, stem: str):
-        """Stage an existing stored file as the next job to run.
+        """Load a stored file into the Job window (resolve its display name).
 
-        Copies {stem}.gcode → uploaded.gcode and records the display name in
-        uploaded.filename so /api/job/start picks it up normally.
+        Deliberately does NOT copy the contents anywhere: /api/job/start receives
+        this stem and streams the stored {stem}.gcode in place, so re-running a
+        saved job never leaves a duplicate behind. (It used to copy the file to
+        uploaded.gcode, which start then re-archived under a new timestamped name
+        on every run.) The 'uploaded' staging file keeps its sidecar name.
         """
-        import shutil as _shutil
         cfg = _config(request)
         storage_dir = Path(cfg.job.storage_dir).expanduser()
         src = storage_dir / f"{stem}.gcode"
         if not src.exists():
             raise HTTPException(status_code=404, detail="File not found")
 
-        def _select():
-            # If selecting the already-staged file, skip the copy
-            dest = storage_dir / "uploaded.gcode"
-            if src != dest:
-                _shutil.copy2(str(src), str(dest))
-            # Derive display name: sidecar for uploaded, meta JSON for timestamped files
+        def _display_name():
             sidecar = storage_dir / "uploaded.filename"
             if stem == "uploaded" and sidecar.exists():
                 try:
@@ -317,18 +335,16 @@ def create_router() -> APIRouter:
                 except Exception:
                     return stem
             meta_path = storage_dir / f"{stem}.meta.json"
-            display_name = stem
             if meta_path.exists():
                 try:
                     import json as _json
                     meta = _json.loads(meta_path.read_text(encoding="utf-8"))
-                    display_name = meta.get("original_filename") or stem
+                    return meta.get("original_filename") or stem
                 except Exception:
                     pass
-            (storage_dir / "uploaded.filename").write_text(display_name, encoding="utf-8")
-            return display_name
+            return stem
 
-        display_name = await asyncio.to_thread(_select)
+        display_name = await asyncio.to_thread(_display_name)
         return {"ok": True, "display_name": display_name}
 
     @router.get("/api/webcam")
