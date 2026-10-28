@@ -36,11 +36,13 @@ IDLE_COMPLETE_POLLS = 3
 # this means the controller has parsed everything we sent it.
 RX_DRAINED_MARGIN = 8
 
-# Consecutive Hold/Door status reports, while the proxy has NOT requested a
-# pause, before the job is treated as faulted. ~2s at 4 Hz: long enough to ride
-# out the brief Hold→Run transition after a resume, short enough that a door,
-# lid or airflow interlock holding the head in place is caught quickly.
-HOLD_FAULT_POLLS = 8
+# After an operator resume (~), GRBL can still report Hold for a moment while it
+# restarts motion. Hold/Door reports inside this window are not treated as a
+# machine-initiated pause.
+RESUME_GRACE_S = 1.5
+# Consecutive held, stationary reports with laser power still on before a
+# machine hold is declared unsafe. Two rules out one report racing the stop.
+LASER_ON_HELD_POLLS = 2
 
 # Seconds with no ack and no change in machine position (while not paused and
 # not Idle) before the job is declared stalled. A healthy job produces one or
@@ -138,7 +140,8 @@ class GrblStreamer:
         # Fault detection (see _status_fault / _stall_fault).
         self._stall_timeout_s = stall_timeout_s
         self._max_dwell_s = 0.0
-        self._hold_polls = 0
+        self._laser_on_polls = 0
+        self._resume_grace_until = 0.0
         self._last_mpos: tuple[float, float, float] | None = None
         self._last_progress = time.monotonic()
         # Machine-initiated pause supervision (see _enter_machine_hold).
@@ -146,6 +149,7 @@ class GrblStreamer:
         self._machine_hold: str | None = None
         self._hold_started = 0.0
         self._hold_confirmed = False
+        self._hold_from_status = False
         self._last_status_time = time.monotonic()
         # Set when a machine hold ends, cleared by the next ok: an Idle in that
         # window with lines still in flight means the firmware dropped them.
@@ -223,7 +227,7 @@ class GrblStreamer:
         logger.debug("Streamer: resumed")
         # The time spent paused is not a stall — restart the watchdog clock.
         self._last_progress = time.monotonic()
-        self._hold_polls = 0
+        self._resume_grace_until = time.monotonic() + RESUME_GRACE_S
         self._resume_event.set()
 
     def cancel(self) -> None:
@@ -665,10 +669,7 @@ class GrblStreamer:
         tests) instead of depending on how two tasks happen to interleave.
         """
         now = time.monotonic()
-        interval = self._poll_interval
-        if self._machine_hold is not None and not self._hold_confirmed:
-            interval = min(interval, HOLD_POLL_INTERVAL)
-        if now - self._last_poll < interval:
+        if now - self._last_poll < self._current_poll_interval():
             return
         self._last_poll = now
         try:
@@ -686,7 +687,7 @@ class GrblStreamer:
         message per iteration.
         """
         if not pending:
-            line = await self._serial.read_line()
+            line = await self._read_line_polling()
             if not line:
                 return ""
             self._trace.append((time.monotonic(), "<", line))
@@ -694,6 +695,35 @@ class GrblStreamer:
             if not pending:
                 return ""
         return pending.popleft()
+
+    async def _read_line_polling(self) -> str:
+        """read_line(), but keep the '?' poll on schedule while it waits.
+
+        read_line() blocks up to its 1s timeout when the port is quiet — and a
+        held machine is quiet apart from the status replies we ask for. Polling
+        only between reads therefore collapsed the status rate to ~1 Hz exactly
+        when supervision needs it most. The read is left running (never
+        cancelled mid-read, which could drop bytes); polls are written beside
+        it by this same coroutine.
+        """
+        read = asyncio.ensure_future(self._serial.read_line())
+        try:
+            while True:
+                wait = self._last_poll + self._current_poll_interval() - time.monotonic()
+                done, _ = await asyncio.wait({read}, timeout=max(wait, 0.01))
+                if done:
+                    return read.result()
+                await self._maybe_poll()
+        except BaseException:
+            if not read.done():
+                read.cancel()
+                await asyncio.gather(read, return_exceptions=True)
+            raise
+
+    def _current_poll_interval(self) -> float:
+        if self._machine_hold is not None and not self._hold_confirmed:
+            return min(self._poll_interval, HOLD_POLL_INTERVAL)
+        return self._poll_interval
 
     # ------------------------------------------------------------------
     # Fault detection and fail-safe
@@ -721,26 +751,25 @@ class GrblStreamer:
 
         state = status.get("state") or ""
         if state.startswith("Alarm"):
-            self._hold_polls = 0
             return (
                 f"GRBL entered Alarm state after {self._lines_sent} lines "
                 f"(no ALARM:N line was received)"
             )
+        if (
+            self._machine_hold is None
+            and state.startswith(_HOLD_LIKE)
+            and not self.is_paused
+            and time.monotonic() >= self._resume_grace_until
+        ):
+            # A hold the proxy didn't ask for: a lid/drawer/air interlock or
+            # another firmware-initiated hold. Supervise it at once — the
+            # Falcon sometimes holds without sending any ERROR line first.
+            self._enter_machine_hold(state, from_status=True)
         if self._machine_hold is not None:
             return self._machine_hold_check(status, state, moved)
-        if state.startswith(_HOLD_LIKE) and not self.is_paused:
-            # A hold the proxy didn't ask for: a door/lid/air interlock or a
-            # firmware-initiated hold. Brief ones occur right after a resume;
-            # a sustained one is supervised like a vendor-fault pause.
-            self._hold_polls += 1
-            if self._hold_polls >= HOLD_FAULT_POLLS:
-                self._enter_machine_hold(state)
-                return self._machine_hold_check(status, state, moved)
-        else:
-            self._hold_polls = 0
         return None
 
-    def _enter_machine_hold(self, reason: str) -> None:
+    def _enter_machine_hold(self, reason: str, from_status: bool = False) -> None:
         """Start supervising a pause the machine initiated on its own."""
         if self._machine_hold is not None:
             logger.info(
@@ -749,9 +778,10 @@ class GrblStreamer:
             )
             return
         self._machine_hold = reason
+        self._hold_from_status = from_status
         self._hold_started = time.monotonic()
         self._hold_confirmed = False
-        self._hold_polls = 0
+        self._laser_on_polls = 0
         logger.warning(
             "Streamer: machine paused itself after %d lines: %s — waiting up to "
             "%.1fs for it to report stopped with the laser off",
@@ -766,47 +796,68 @@ class GrblStreamer:
         """Supervise an active machine hold from one status report.
 
         The hold is only waited out once the machine proves it is safe: a held
-        state, no motion, and a report carrying the override field (Ov) without
-        an enabled spindle/laser accessory (A:S / A:C). GRBL only sends A: in
-        reports that carry Ov:, and forces one when the spindle state changes,
-        so that combination is positive evidence the laser output is off.
+        state, no motion, and laser power reported off (see _laser_power).
         """
         reason = self._machine_hold
         held = state in _HELD_STATES or state in _HOLD_LIKE
-        laser_on = any(c in status.get("a", "") for c in "SC")
-        laser_off_evidence = "ov" in status and not laser_on
+        laser = self._laser_power(status)
 
-        if not self._hold_confirmed:
-            if held and not moved and laser_off_evidence:
-                self._hold_confirmed = True
-                logger.warning(
-                    "Streamer: machine hold confirmed safe (%s, laser off) — "
-                    "waiting for the machine to resume: %s",
-                    state, grbl_protocol.describe_vendor_fault(reason),
-                )
-            return None  # the confirmation window is enforced by _stall_fault
-
-        if not state.startswith(_HOLD_LIKE) or state == "Door:3":
-            held_for = time.monotonic() - self._hold_started
+        resumed = not state.startswith(_HOLD_LIKE) or state == "Door:3"
+        # A hold entered from a vendor ERROR line can arrive before the status
+        # catches up, so a stale Run report must not end it. One entered from
+        # a status report ends as soon as the status leaves Hold/Door.
+        if resumed and (self._hold_confirmed or self._hold_from_status):
             logger.info(
                 "Streamer: machine resumed (%s) after %s — held %.1fs",
-                state, reason, held_for,
+                state, reason, time.monotonic() - self._hold_started,
             )
             self._machine_hold = None
             self._hold_confirmed = False
+            self._hold_from_status = False
             self._resumed_from_hold = True
             self._last_progress = time.monotonic()
             return None
-        if held and laser_on:
-            return (
-                f"machine held ({state}) after {reason} but reports its laser "
-                f"output ON (A:{status.get('a')})"
-            )
-        if held and moved:
+
+        if held and moved and self._hold_confirmed:
             return (
                 f"machine reports {state} after {reason} but the head is moving "
                 f"(MPos {self._last_mpos})"
             )
+        if held and not moved and laser is True:
+            self._laser_on_polls += 1
+            if self._laser_on_polls >= LASER_ON_HELD_POLLS:
+                return (
+                    f"machine held ({state}) after {reason} but reports laser "
+                    f"power still ON (FS:{status.get('fs')} A:{status.get('a')})"
+                )
+            return None
+        self._laser_on_polls = 0
+
+        if not self._hold_confirmed and held and not moved and laser is False:
+            self._hold_confirmed = True
+            logger.warning(
+                "Streamer: machine hold confirmed safe (%s, laser off) — "
+                "waiting for the machine to resume: %s",
+                state, grbl_protocol.describe_vendor_fault(reason),
+            )
+        # An unconfirmed hold's deadline is enforced by _stall_fault.
+        return None
+
+    @staticmethod
+    def _laser_power(status: grbl_protocol.StatusReport) -> bool | None:
+        """True/False if the report shows laser power on/off, None if unknown.
+
+        The FS spindle figure is the primary signal: on the Falcon it is the
+        live output, dropping to 0 the moment the machine holds (while A:S
+        stays set, because A: only mirrors the modal M3/M4 state there). When
+        a report has no FS, fall back to the accessory field: GRBL sends A:
+        only alongside Ov:, so Ov: without A:S/A:C means the output is off.
+        """
+        fs = status.get("fs")
+        if fs is not None:
+            return fs[1] > 0
+        if "ov" in status:
+            return any(c in status.get("a", "") for c in "SC")
         return None
 
     def _stall_fault(self) -> str | None:

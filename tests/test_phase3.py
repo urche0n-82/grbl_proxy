@@ -17,7 +17,7 @@ import pytest
 from grbl_proxy import grbl_protocol
 from grbl_proxy.config import AutoDetectConfig, JobConfig
 from grbl_proxy.proxy_core import ProxyCore, ProxyState
-from grbl_proxy.streamer import HOLD_FAULT_POLLS, IDLE_COMPLETE_POLLS, GrblStreamer, StreamerResult
+from grbl_proxy.streamer import IDLE_COMPLETE_POLLS, GrblStreamer, StreamerResult
 from grbl_proxy.tcp_server import TcpServer
 from tests.mock_grbl import MockSerialConnection
 
@@ -1450,8 +1450,8 @@ class TestFaultSafety:
         assert "FAIL-SAFE soft reset" in caplog.text
 
     async def test_unrequested_hold_without_laser_off_evidence_is_a_fault(self, tmp_path):
-        """A hold the proxy didn't ask for is supervised; with no report that
-        the laser is off (no Ov field) it can't be proven safe → fail-safe."""
+        """A hold the proxy didn't ask for is supervised; with no report of the
+        laser power (no FS, no Ov) it can't be proven safe → fail-safe."""
         gcode = tmp_path / "job.gcode"
         _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600"])
         mock = MockSerialConnection(auto_respond=False)
@@ -1460,8 +1460,9 @@ class TestFaultSafety:
 
         task = asyncio.create_task(streamer.run())
         await asyncio.sleep(0.05)
-        for _ in range(HOLD_FAULT_POLLS):
-            mock.inject("<Hold:0|MPos:1.000,1.000,0.000|FS:0,0>")
+        for _ in range(8):
+            mock.inject("<Hold:0|MPos:1.000,1.000,0.000>")
+            await asyncio.sleep(0.05)
         await asyncio.wait_for(task, timeout=4.0)
 
         assert "Hold:0" in results[0].message
@@ -1472,7 +1473,7 @@ class TestFaultSafety:
         streamer = GrblStreamer(tmp_path / "x.gcode", MockSerialConnection(), on_done=lambda r: None)
         streamer.pause()
         status = grbl_protocol.parse_status_report("<Hold:0|MPos:1.000,1.000,0.000|FS:0,0>")
-        for _ in range(HOLD_FAULT_POLLS * 3):
+        for _ in range(24):
             assert streamer._status_fault(status) is None
 
     async def test_stall_watchdog_fires_when_frozen(self, tmp_path):
@@ -1674,9 +1675,10 @@ class TestMachineHold:
         await asyncio.sleep(0.1)
         assert streamer.machine_hold_confirmed
         mock.inject(_HELD_LASER_ON)
+        mock.inject(_HELD_LASER_ON)
         await asyncio.wait_for(task, timeout=3.0)
 
-        assert "laser output ON" in results[0].message
+        assert "laser power still ON" in results[0].message
         assert _soft_reset_sent(mock)
 
     async def test_vendor_fault_but_machine_still_running_is_a_fault(self, tmp_path):
@@ -1737,13 +1739,10 @@ class TestMachineHold:
         mock = MockSerialConnection(auto_respond=False)
         results = []
         streamer = _hold_streamer(tmp_path, mock, results)
-        # Keep the production ordering: the unrequested-hold debounce
-        # (HOLD_FAULT_POLLS) must elapse well inside the stall timeout.
-        streamer._stall_timeout_s = 2.0
 
         task = asyncio.create_task(streamer.run())
         await asyncio.sleep(0.05)
-        for _ in range(HOLD_FAULT_POLLS + 6):
+        for _ in range(14):
             mock.inject("<Door:1|MPos:5.000,5.000,0.000|FS:0,0|Ov:100,100,100>")
             await asyncio.sleep(0.05)
         assert results == []
@@ -1770,6 +1769,54 @@ class TestMachineHold:
         await asyncio.wait_for(task, timeout=3.0)
         assert "Alarm" in results[0].message
         assert _soft_reset_sent(mock)
+
+
+class TestFalconHoldTrace:
+    """Replays the hardware trace from 2026-10-28: drawer opened mid-burn, no
+    ERROR line, status Hold:0 with FS spindle 0 but A:S still set (A: mirrors
+    the modal M3 state on this firmware, not the live output). The machine
+    must be waited on — previously the stall watchdog reset it after 5s."""
+
+    async def test_hold_with_fs_zero_and_modal_a_s_is_safe(self, tmp_path):
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["M3 S20", "G1 Y2.15S20", "G1 S0"])
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, stall_timeout_s=0.5)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("<Run|MPos:77.812,147.875,0.000|Bf:126,65464|FS:3000,20|Ov:100,100,100|A:S>")
+        mock.inject("<Hold:0|MPos:77.812,101.950,0.000|Bf:126,65424|FS:0,0|Ov:100,100,100|A:S>")
+        mock.inject("<Hold:0|MPos:77.812,101.950,0.000|Bf:126,65424|FS:0,0|WCO:0.000,0.000,0.000>")
+        for _ in range(15):  # 1.5s: 3x the stall timeout
+            mock.inject("<Hold:0|MPos:77.812,101.950,0.000|Bf:126,65424|FS:0,0>")
+            await asyncio.sleep(0.1)
+        assert results == [], results
+        assert streamer.machine_hold_confirmed
+
+        mock.inject("<Run|MPos:77.812,100.000,0.000|Bf:126,65424|FS:3000,20>")
+        for _ in range(3):
+            mock.inject("ok")
+        await asyncio.wait_for(task, timeout=3.0)
+        assert results[0].completed
+        assert not _soft_reset_sent(mock)
+
+
+class TestPollCadence:
+    async def test_polls_keep_running_while_serial_is_quiet(self, tmp_path):
+        """read_line blocks up to 1s on a quiet port; polls must not wait for
+        it, or status drops to ~1 Hz exactly when the machine is held."""
+        mock = MockSerialConnection(auto_respond=False)
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["G1 X10"])
+        streamer = GrblStreamer(gcode, mock, on_done=lambda r: None)
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(1.0)
+        polls = sum(chunk.count(b"?") for chunk in mock.tx_log)
+        streamer.cancel()
+        await asyncio.wait_for(task, timeout=3.0)
+        assert polls >= 3, f"only {polls} poll(s) in 1s on a quiet port"
 
 
 class TestVendorFaultDescriptions:
