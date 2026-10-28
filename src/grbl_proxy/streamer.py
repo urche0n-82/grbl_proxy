@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from collections import deque
 from dataclasses import dataclass
@@ -34,6 +35,27 @@ IDLE_COMPLETE_POLLS = 3
 # Bytes of GRBL RX occupancy still counted as "drained". Anything at or below
 # this means the controller has parsed everything we sent it.
 RX_DRAINED_MARGIN = 8
+
+# Consecutive Hold/Door status reports, while the proxy has NOT requested a
+# pause, before the job is treated as faulted. ~2s at 4 Hz: long enough to ride
+# out the brief Hold→Run transition after a resume, short enough that a door,
+# lid or airflow interlock holding the head in place is caught quickly.
+HOLD_FAULT_POLLS = 8
+
+# Seconds with no ack and no change in machine position (while not paused and
+# not Idle) before the job is declared stalled. A healthy job produces one or
+# the other continuously: oks while the planner has room, moving MPos while it
+# is full. The longest G4 dwell in the file is added on top so dwells can't trip
+# it. A stall here means the head is parked mid-job — with a constant-power (M3)
+# laser that is the fire hazard this watchdog exists to catch.
+STALL_TIMEOUT_S = 5.0
+
+# Recent serial traffic kept in memory for post-mortem logging. Recording is a
+# deque append (no logging), so it is always on: DEBUG logging changes timing
+# enough to hide timing-dependent faults, so the evidence must not depend on it.
+TRACE_LEN = 300
+
+_G4_DWELL_RE = re.compile(r"\bG0*4\b.*?P\s*([\d.]+)", re.IGNORECASE)
 
 
 @dataclass
@@ -73,6 +95,7 @@ class GrblStreamer:
         on_status: Callable[[grbl_protocol.StatusReport], None] | None = None,
         poll_interval: float = POLL_INTERVAL,
         rx_buffer_size: int = RX_BUFFER_SIZE,
+        stall_timeout_s: float = STALL_TIMEOUT_S,
     ) -> None:
         self._path = gcode_path
         self._serial = serial_conn
@@ -96,6 +119,14 @@ class GrblStreamer:
         # bytes are in flight. Only a sustained streak is treated as evidence
         # that our accounting is stale — see _buffer_looks_phantom.
         self._rx_drained_polls = 0
+        # Fault detection (see _status_fault / _stall_fault).
+        self._stall_timeout_s = stall_timeout_s
+        self._max_dwell_s = 0.0
+        self._hold_polls = 0
+        self._last_mpos: tuple[float, float, float] | None = None
+        self._last_progress = time.monotonic()
+        # Always-on post-mortem trace of serial traffic (see TRACE_LEN).
+        self._trace: deque[tuple[float, str, str]] = deque(maxlen=TRACE_LEN)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -105,17 +136,31 @@ class GrblStreamer:
         """Entry point for asyncio.create_task(). Drives the full lifecycle."""
         result: StreamerResult | None = None
         try:
-            lines = await self._load_lines()
-            self._total_lines = len(lines)
-            logger.info(
-                "Streamer: starting execution of %d lines from %s",
-                self._total_lines,
-                self._path,
-            )
-            # No separate poll task: _stream_lines emits '?' inline so exactly
-            # one coroutine owns the serial port. A concurrent poller makes the
-            # request/response ordering nondeterministic and untestable.
-            result = await self._stream_lines(lines)
+            try:
+                lines = await self._load_lines()
+                self._total_lines = len(lines)
+                logger.info(
+                    "Streamer: starting execution of %d lines from %s",
+                    self._total_lines,
+                    self._path,
+                )
+                # No separate poll task: _stream_lines emits '?' inline so
+                # exactly one coroutine owns the serial port. A concurrent
+                # poller makes the request/response ordering nondeterministic
+                # and untestable.
+                result = await self._stream_lines(lines)
+            except SerialDisconnectedError:
+                raise  # handled below — no fail-safe write is possible
+            except Exception as e:
+                # Any other exception used to escape with result=None, so
+                # on_done never ran: the proxy stayed EXECUTING forever with
+                # nobody reading or polling serial, and the error was never
+                # logged. Turn it into a fault so the fail-safe below runs.
+                logger.exception("Streamer: internal error during streaming")
+                result = self._fault_result(f"internal streamer error: {e!r}")
+
+            if self._is_fault(result):
+                await self._failsafe_stop(result)
         except asyncio.CancelledError:
             result = StreamerResult(
                 completed=False,
@@ -129,6 +174,7 @@ class GrblStreamer:
             raise
         except SerialDisconnectedError as e:
             logger.error("Serial disconnected during streaming: %s", e)
+            self._dump_trace(f"serial disconnected: {e}")
             result = StreamerResult(
                 completed=False,
                 cancelled=True,
@@ -150,6 +196,9 @@ class GrblStreamer:
     def resume(self) -> None:
         """Resume after pause. Called when LightBurn sends cycle resume (~)."""
         logger.debug("Streamer: resumed")
+        # The time spent paused is not a stall — restart the watchdog clock.
+        self._last_progress = time.monotonic()
+        self._hold_polls = 0
         self._resume_event.set()
 
     def cancel(self) -> None:
@@ -198,6 +247,14 @@ class GrblStreamer:
         # one line can carry several when the firmware interleaves writes.
         pending: deque[str] = deque()
 
+        # A G4 dwell legitimately parks the head with no acks and no motion;
+        # widen the stall watchdog by the longest one so it can't false-trip.
+        self._max_dwell_s = max(
+            (float(m.group(1)) for ln in lines if (m := _G4_DWELL_RE.search(ln))),
+            default=0.0,
+        )
+        self._last_progress = time.monotonic()
+
         for i, line in enumerate(lines):
             # Respect pause (feed hold from LightBurn or web dashboard)
             await self._resume_event.wait()
@@ -238,11 +295,14 @@ class GrblStreamer:
                         lines_sent=self._lines_sent,
                         total_lines=len(lines),
                     )
+                if (stall := self._stall_fault()) is not None:
+                    return self._fault_result(stall)
                 await self._maybe_poll()
                 response = await self._next_response(pending)
                 if not response:
                     continue  # serial timeout tick, keep waiting
                 if grbl_protocol.is_ok(response):
+                    self._last_progress = time.monotonic()
                     idle_polls = 0
                     # An ack is proof the accounting is tracking — any
                     # drained-RX streak we were building is not a phantom.
@@ -312,6 +372,8 @@ class GrblStreamer:
                     if status:
                         if self._on_status:
                             self._on_status(status)
+                        if (fault := self._status_fault(status)) is not None:
+                            return self._fault_result(fault)
                         # A sustained drained RX proves our count is stale.
                         # Reset BOTH halves together: buffer_used and
                         # line_lengths must stay consistent or later acks
@@ -404,6 +466,7 @@ class GrblStreamer:
                     )
 
             # Send the line
+            self._trace.append((time.monotonic(), ">", line))
             await self._serial.write((line + "\n").encode())
             buffer_used += line_bytes
             line_lengths.append(line_bytes)
@@ -447,11 +510,14 @@ class GrblStreamer:
                     lines_sent=self._lines_sent,
                     total_lines=len(lines),
                 )
+            if (stall := self._stall_fault()) is not None:
+                return self._fault_result(stall)
             await self._maybe_poll()
             response = await self._next_response(pending)
             if not response:
                 continue
             if grbl_protocol.is_ok(response):
+                self._last_progress = time.monotonic()
                 line_lengths.popleft()
                 idle_polls = 0
             elif grbl_protocol.is_error(response):
@@ -488,6 +554,8 @@ class GrblStreamer:
                 if status:
                     if self._on_status:
                         self._on_status(status)
+                    if (fault := self._status_fault(status)) is not None:
+                        return self._fault_result(fault)
                     if status.get("state") == "Idle":
                         idle_polls += 1
                         if idle_polls >= IDLE_COMPLETE_POLLS:
@@ -581,10 +649,137 @@ class GrblStreamer:
             line = await self._serial.read_line()
             if not line:
                 return ""
+            self._trace.append((time.monotonic(), "<", line))
             pending.extend(grbl_protocol.split_responses(line))
             if not pending:
                 return ""
         return pending.popleft()
+
+    # ------------------------------------------------------------------
+    # Fault detection and fail-safe
+    # ------------------------------------------------------------------
+
+    def _status_fault(self, status: grbl_protocol.StatusReport) -> str | None:
+        """Return a fault description if a status report shows the job is dead.
+
+        GRBL announces an alarm with a single ALARM:N line. If that one line is
+        lost (e.g. mangled by the firmware's write interleaving), the status
+        report is the only remaining evidence — and an alarmed controller has
+        flushed its buffers, so the acks we're draining for never arrive. Acting
+        on the reported state is what keeps that from becoming an endless drain
+        with the head parked and (under M3) the laser still firing.
+
+        Also tracks machine position for the stall watchdog.
+        """
+        mpos = status.get("mpos") or status.get("wpos")
+        if mpos is not None and mpos != self._last_mpos:
+            self._last_mpos = mpos
+            self._last_progress = time.monotonic()
+
+        state = status.get("state") or ""
+        if state.startswith("Alarm"):
+            self._hold_polls = 0
+            return (
+                f"GRBL entered Alarm state after {self._lines_sent} lines "
+                f"(no ALARM:N line was received)"
+            )
+        if state.startswith(("Hold", "Door")) and not self.is_paused:
+            # A hold the proxy didn't ask for: a door/lid/air interlock or a
+            # firmware-initiated hold. Brief ones occur right after a resume.
+            self._hold_polls += 1
+            if self._hold_polls >= HOLD_FAULT_POLLS:
+                return (
+                    f"GRBL held in {state} for {self._hold_polls} status polls "
+                    f"after {self._lines_sent} lines without a pause request — "
+                    f"interlock or firmware hold"
+                )
+        else:
+            self._hold_polls = 0
+        return None
+
+    def _stall_fault(self) -> str | None:
+        """Return a fault description if the job has stopped making progress."""
+        now = time.monotonic()
+        if self.is_paused:
+            # An operator hold is intentional — never a stall.
+            self._last_progress = now
+            return None
+        limit = self._stall_timeout_s + self._max_dwell_s
+        stalled_for = now - self._last_progress
+        if stalled_for < limit:
+            return None
+        return (
+            f"job stalled: no ack and no machine motion for {stalled_for:.1f}s "
+            f"after {self._lines_sent} lines (last position {self._last_mpos})"
+        )
+
+    def _fault_result(self, message: str) -> StreamerResult:
+        logger.error("Streamer: %s", message)
+        return StreamerResult(
+            completed=False,
+            cancelled=False,
+            error_line=None,
+            error_code=None,
+            alarm_code=None,
+            lines_sent=self._lines_sent,
+            total_lines=self._total_lines,
+            message=message,
+        )
+
+    @staticmethod
+    def _is_fault(result: StreamerResult | None) -> bool:
+        """An abnormal end that the proxy must make safe.
+
+        Excludes normal completion and cancellation (an operator cancel already
+        forwards its own 0x18; a serial disconnect leaves nothing to write to).
+        """
+        return result is not None and not result.completed and not result.cancelled
+
+    async def _failsafe_stop(self, result: StreamerResult) -> None:
+        """Soft-reset GRBL so a faulted job can't leave the laser on.
+
+        0x18 is a realtime byte: GRBL acts on it from ANY state, killing the
+        spindle/laser and all queued motion at once. Line commands can't do
+        that — M5 is refused with error:9 while alarmed and queues behind the
+        held motion while in Hold. Detecting a fault without doing this leaves
+        whatever the firmware left behind, which on a constant-power (M3) job
+        can be a stationary, firing laser.
+        """
+        reason = (
+            result.message
+            or (f"ALARM:{result.alarm_code}" if result.alarm_code is not None else None)
+            or (f"error:{result.error_code}" if result.error_code is not None else None)
+            or "unknown fault"
+        )
+        self._dump_trace(reason)
+        try:
+            await self._serial.write(b"\x18")
+            logger.error(
+                "Streamer: FAIL-SAFE soft reset sent to stop laser and motion (%s). "
+                "Machine position is lost — re-home ($H) before running again.",
+                reason,
+            )
+        except Exception as e:
+            logger.critical(
+                "Streamer: FAIL-SAFE soft reset could NOT be sent (%s) — the laser "
+                "may still be on. Power the machine off. Fault: %s",
+                e, reason,
+            )
+
+    def _dump_trace(self, reason: str) -> None:
+        """Log the recent serial traffic so a fault leaves evidence behind."""
+        if not self._trace:
+            return
+        t_end = self._trace[-1][0]
+        body = "\n".join(
+            f"  {t - t_end:+8.3f}s {direction} {text!r}"
+            for t, direction, text in self._trace
+        )
+        logger.error(
+            "Streamer: last %d serial events before fault (%s) "
+            "[> sent, < received]:\n%s",
+            len(self._trace), reason, body,
+        )
 
     def _buffer_looks_phantom(
         self, status: grbl_protocol.StatusReport, buffer_used: int

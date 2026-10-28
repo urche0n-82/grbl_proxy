@@ -386,6 +386,24 @@ class ProxyCore:
                 await self._spoof_ok(writer)
                 return
 
+            # Laser-off must never be refused. Rejecting M5 here with error:9
+            # would leave an operator unable to turn the laser off from
+            # LightBurn after a fault. Forward it; GRBL's own reply (ok, or
+            # error:9 if it is alarm-locked after the fail-safe reset — by
+            # which point the laser is already off) flows back via the relay.
+            normalized = _normalize_gcode(line)
+            if normalized == "M5" or normalized.startswith("M5 "):
+                logger.info("Forwarding %s in ERROR state (laser off)", line.strip())
+                try:
+                    await serial_conn.write((line + "\n").encode())
+                except Exception as e:
+                    logger.warning("Serial write error forwarding M5: %s", e)
+                    # GRBL never got it, so no reply is coming — answer for it
+                    # so LightBurn's ack accounting doesn't hang.
+                    writer.write(b"error:9" + grbl_protocol.LINE_TERMINATOR.encode())
+                    await writer.drain()
+                return
+
             # Blocked until operator clears the error with $X or $H
             upper = line.strip().upper()
             if upper in ("$X", "$H"):

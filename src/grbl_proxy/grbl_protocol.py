@@ -60,10 +60,17 @@ def is_status_report(line: str) -> bool:
 
 # A complete status report block, e.g. "<Idle|MPos:0,0,0|FS:0,0>".
 _STATUS_BLOCK_RE = re.compile(r"<[^<>]*>")
-# A protocol message trailing a corrupted line. Deliberately NOT anchored with a
-# leading \b: the observed corruption splices the ack straight onto a digit
+# An ack trailing a corrupted line. Deliberately NOT anchored with a leading \b:
+# the observed corruption splices the ack straight onto a digit
 # ("WCO:0.000,0ok"), where a word boundary would fail to match.
-_TRAILING_MESSAGE_RE = re.compile(r"(ok|error:\d+|ALARM:\d+)\s*$")
+_TRAILING_OK_RE = re.compile(r"ok\s*$")
+# Fault tokens recovered from ANYWHERE in a corrupted line, not just its end: an
+# ALARM:N with a truncated status spliced after it ("ALARM:1<Run|MPos:1,2") must
+# not be lost. "error" is case-insensitive with an optional trailing period so
+# the Creality vendor form "ERROR:04." is caught too. ALARM stays case-sensitive
+# so a truncated "<Alarm|..." status fragment can't masquerade as one.
+_FAULT_TOKEN_RE = re.compile(r"(?i:error):\s*\d+\.?|ALARM:\d+")
+_EXACT_ALARM_RE = re.compile(r"^ALARM:\d+$")
 
 
 def split_responses(line: str) -> list[str]:
@@ -90,7 +97,9 @@ def split_responses(line: str) -> list[str]:
         return []
 
     # Fast path: a clean, complete single message (the overwhelming majority).
-    if is_ok(s) or is_error(s) or is_alarm(s) or is_status_report(s):
+    # The alarm check must be exact: is_alarm() only tests the prefix, so it
+    # would wave through "ALARM:1<Run|MPos:..." whole and the code would be lost.
+    if is_ok(s) or is_error(s) or _EXACT_ALARM_RE.match(s) or is_status_report(s):
         return [s]
 
     # Possibly interleaved. Lift out any complete status blocks first, blanking
@@ -103,9 +112,14 @@ def split_responses(line: str) -> list[str]:
 
     remainder = _STATUS_BLOCK_RE.sub(_lift, s)
 
-    trailing = _TRAILING_MESSAGE_RE.search(remainder)
-    if trailing:
-        messages.append(trailing.group(1))
+    # Bracketed feedback ([MSG:...], vendor help text) is free text — scanning
+    # it for fault tokens could fabricate one from a message's wording.
+    if not s.startswith("["):
+        # A lost fault is the dangerous direction (the streamer keeps waiting
+        # while the machine sits stopped), so recover every fault token present.
+        messages.extend(m.group(0) for m in _FAULT_TOKEN_RE.finditer(remainder))
+    if _TRAILING_OK_RE.search(remainder):
+        messages.append("ok")
 
     # Nothing salvageable (e.g. "[MSG:...]", banner) — hand back untouched.
     return messages or [s]

@@ -17,7 +17,7 @@ import pytest
 from grbl_proxy import grbl_protocol
 from grbl_proxy.config import AutoDetectConfig, JobConfig
 from grbl_proxy.proxy_core import ProxyCore, ProxyState
-from grbl_proxy.streamer import IDLE_COMPLETE_POLLS, GrblStreamer, StreamerResult
+from grbl_proxy.streamer import HOLD_FAULT_POLLS, IDLE_COMPLETE_POLLS, GrblStreamer, StreamerResult
 from grbl_proxy.tcp_server import TcpServer
 from tests.mock_grbl import MockSerialConnection
 
@@ -1399,3 +1399,228 @@ class TestStreamerErrorHandling:
             await writer.wait_closed()
         finally:
             await server.stop()
+
+
+# ---------------------------------------------------------------------------
+# Fault safety: a faulted job must never leave the laser on.
+#
+# Field report: mid-job the head froze in place with a constant-power (M3) laser
+# still firing while LightBurn showed Alarm. Each test below covers one chain by
+# which a fault could go undetected, or be detected without making the machine
+# safe. The fail-safe is a realtime soft reset (0x18): the only command GRBL
+# obeys from any state, killing laser and motion at once.
+# ---------------------------------------------------------------------------
+
+_ALARM_STATUS = "<Alarm|MPos:10.000,20.000,0.000|FS:0,0>"
+_RUN_FROZEN = "<Run|MPos:10.000,20.000,0.000|FS:0,1000>"
+
+
+def _soft_reset_sent(mock: MockSerialConnection) -> bool:
+    return any(b"\x18" in chunk for chunk in mock.tx_log)
+
+
+class TestFaultSafety:
+    async def test_alarm_status_without_alarm_line_stops_and_resets(self, tmp_path, caplog):
+        """The single ALARM:N line was lost; only the status report says Alarm.
+        Previously ignored → endless drain with the head parked."""
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600", "G1 X20"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject(_ALARM_STATUS)
+        with caplog.at_level(logging.ERROR):
+            await asyncio.wait_for(task, timeout=3.0)
+
+        r = results[0]
+        assert not r.completed and not r.cancelled
+        assert "Alarm" in r.message
+        assert _soft_reset_sent(mock), "fail-safe 0x18 was not sent"
+        assert "FAIL-SAFE soft reset" in caplog.text
+
+    async def test_unrequested_hold_is_a_fault(self, tmp_path):
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        for _ in range(HOLD_FAULT_POLLS):
+            mock.inject("<Hold:0|MPos:1.000,1.000,0.000|FS:0,0>")
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert "Hold:0" in results[0].message
+        assert _soft_reset_sent(mock)
+
+    def test_hold_during_operator_pause_is_not_a_fault(self, tmp_path):
+        streamer = GrblStreamer(tmp_path / "x.gcode", MockSerialConnection(), on_done=lambda r: None)
+        streamer.pause()
+        status = grbl_protocol.parse_status_report("<Hold:0|MPos:1.000,1.000,0.000|FS:0,0>")
+        for _ in range(HOLD_FAULT_POLLS * 3):
+            assert streamer._status_fault(status) is None
+
+    async def test_stall_watchdog_fires_when_frozen(self, tmp_path):
+        """Status says Run but the position never changes and no acks arrive —
+        a silent firmware/module halt. Must time out, not wait forever."""
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, stall_timeout_s=0.3)
+
+        task = asyncio.create_task(streamer.run())
+        for _ in range(4):
+            await asyncio.sleep(0.1)
+            mock.inject(_RUN_FROZEN)
+        await asyncio.wait_for(task, timeout=4.0)
+
+        assert "stalled" in results[0].message
+        assert _soft_reset_sent(mock)
+
+    async def test_stall_watchdog_allows_for_dwell(self, tmp_path):
+        """A G4 dwell parks the head legitimately; it must not trip the watchdog."""
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["G4 P5", "G1 X10 F600"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, stall_timeout_s=0.3)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(1.5)
+        assert results == [], "watchdog fired during a legitimate dwell"
+        streamer.cancel()
+        await asyncio.wait_for(task, timeout=3.0)
+        assert results[0].cancelled
+
+    async def test_moving_head_is_not_a_stall(self, tmp_path):
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, stall_timeout_s=0.3)
+
+        task = asyncio.create_task(streamer.run())
+        for i in range(12):
+            await asyncio.sleep(0.1)
+            mock.inject(f"<Run|MPos:{i}.000,0.000,0.000|FS:600,1000>")
+        assert results == [], "watchdog fired while the head was moving"
+        streamer.cancel()
+        await asyncio.wait_for(task, timeout=3.0)
+
+    async def test_internal_exception_still_reports_and_resets(self, tmp_path, monkeypatch):
+        """An unexpected exception used to escape with on_done never called,
+        wedging the proxy in EXECUTING with nobody reading serial."""
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["G1 X10"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+
+        async def boom(lines):
+            raise ValueError("simulated bug")
+
+        monkeypatch.setattr(streamer, "_stream_lines", boom)
+        await asyncio.wait_for(streamer.run(), timeout=3.0)
+
+        assert len(results) == 1
+        assert "internal streamer error" in results[0].message
+        assert _soft_reset_sent(mock)
+
+    async def test_error_line_triggers_fail_safe(self, tmp_path):
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["G1 X10"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("error:20")
+        await asyncio.wait_for(task, timeout=3.0)
+        assert results[0].error_code == 20
+        assert _soft_reset_sent(mock)
+
+    async def test_normal_completion_sends_no_reset(self, tmp_path):
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["G0 X10", "G1 Y20"])
+        mock = MockSerialConnection(auto_respond=True)
+        results = []
+        await GrblStreamer(gcode, mock, on_done=results.append).run()
+        assert results[0].completed
+        assert not _soft_reset_sent(mock)
+
+    async def test_operator_cancel_sends_no_extra_reset(self, tmp_path):
+        """The proxy already forwards the operator's own 0x18; the streamer
+        must not add a second one on a deliberate cancel."""
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["G1 X10"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        streamer.cancel()
+        await asyncio.wait_for(task, timeout=3.0)
+        assert results[0].cancelled
+        assert not _soft_reset_sent(mock)
+
+    async def test_fault_dumps_serial_trace(self, tmp_path, caplog):
+        gcode = tmp_path / "job.gcode"
+        _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600"])
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject(_ALARM_STATUS)
+        with caplog.at_level(logging.ERROR):
+            await asyncio.wait_for(task, timeout=3.0)
+        assert "serial events before fault" in caplog.text
+        assert "G1 X10 F600" in caplog.text      # what we sent
+        assert "Alarm|MPos" in caplog.text       # what GRBL said
+
+
+class TestFaultTokenRecovery:
+    def test_vendor_error_spliced_after_status(self):
+        out = grbl_protocol.split_responses("<Run|MPos:1.000,2.000,0.000>ERROR:04.")
+        assert "ERROR:04." in out
+        assert grbl_protocol.is_vendor_fault("ERROR:04.")
+
+    def test_alarm_before_truncated_status(self):
+        assert "ALARM:1" in grbl_protocol.split_responses("ALARM:1<Run|MPos:1.000,2")
+
+    def test_alarm_status_fragment_is_not_an_alarm_token(self):
+        assert grbl_protocol.split_responses("<Alarm|MPos:1.000,2") == ["<Alarm|MPos:1.000,2"]
+
+    def test_bracketed_text_is_not_scanned_for_faults(self):
+        s = "[MSG:check error: 5 in manual]"
+        assert grbl_protocol.split_responses(s) == [s]
+
+    def test_interleaved_ok_still_recovered(self):
+        out = grbl_protocol.split_responses("<Run|MPos:296.763,263.250,0.000|WCO:0.000,0ok")
+        assert out == ["ok"]
+
+
+class TestErrorStateLaserOff:
+    async def test_m5_is_forwarded_not_rejected_in_error_state(self, tmp_path):
+        core = ProxyCore(_make_job_cfg(tmp_path), idle_timeout_s=0.1)
+        core._state = ProxyState.ERROR
+        mock = MockSerialConnection(auto_respond=False)
+
+        written = []
+
+        class _W:
+            def write(self, data):
+                written.append(data)
+
+            async def drain(self):
+                pass
+
+        await core.process_client_line("M05", _W(), mock)
+        assert mock.tx_log == [b"M05\n"]
+        assert written == [], "M5 must not be answered with error:9"
+        assert core.state == ProxyState.ERROR
