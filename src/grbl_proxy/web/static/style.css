@@ -185,6 +185,20 @@ main {
 .console-input-row input:focus { border-color: var(--accent); }
 
 /* Job status line (below controls) */
+.hold-banner {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--warning);
+  color: var(--warning);
+  font-weight: 600;
+}
+.hold-banner.hold-danger {
+  border-color: var(--danger);
+  background: var(--danger);
+  color: #fff;
+}
+
 .upload-status {
   margin-top: 8px;
   font-size: 0.82em;

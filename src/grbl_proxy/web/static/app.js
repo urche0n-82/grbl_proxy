@@ -82,6 +82,19 @@ function applySnapshot(s) {
     $("job-elapsed").textContent = "—";
   }
 
+  // Machine-initiated pause (lid/drawer open, airflow, flame, ...)
+  const holdEl = $("machine-hold-banner");
+  if (s.machine_hold) {
+    const verb = s.machine_hold_confirmed
+      ? "Paused by machine"
+      : "Machine stopped — checking it is safe";
+    holdEl.textContent = `${verb}: ${s.machine_hold}. Cancel stops the job.`;
+    holdEl.className = "hold-banner" + (/FLAME/.test(s.machine_hold) ? " hold-danger" : "");
+    holdEl.hidden = false;
+  } else {
+    holdEl.hidden = true;
+  }
+
   // Swap Job controls based on state
   const executing = s.proxy_state === "Executing";
   const paused    = s.proxy_state === "Paused";

@@ -231,6 +231,43 @@ def is_vendor_fault(line: str) -> bool:
     return _ERROR_RE.match(s) is not None and s.startswith("ERROR:")
 
 
+# Creality Falcon 2 vendor fault codes (Creality wiki, "Falcon2 Series Error
+# Code"). Operator-facing LABELS ONLY: whether the streamer waits out a fault or
+# fail-safes is decided from the machine's own status reports, never from this
+# table — a missing or misdescribed code must not be able to make the proxy wait
+# while the laser is still on.
+VENDOR_FAULTS: dict[int, str] = {
+    1: "angle data abnormal — check the workbench is steady and the frame screws tight",
+    2: "no G-code file in the TF card root",
+    4: "no airflow detected — check the air pump, the air knob and the air tube",
+    5: "FLAME DETECTED — check the material; press Reset on the laser module, then start",
+    6: "lens contamination detected — press Reset on the module, then start; clean the lens",
+    7: "laser module overheated — press Reset on the module, then start once it cools",
+    8: "laser module air pressure sensor fault — restart the machine",
+    9: "laser module flame sensor fault — restart the machine",
+    10: "laser module lens sensor fault — restart the machine",
+    11: "laser module LD temperature sensor missing — restart the machine",
+    12: "laser module LD sensor short circuit — restart the machine",
+    13: "laser module CPU too hot — let it cool before working",
+    14: "host CPU too hot — let the machine cool before working",
+    24: "lid or drawer open — close it, then press start on the machine",
+    25: "air pump not working normally",
+}
+
+
+def describe_vendor_fault(line: str) -> str:
+    """Return an operator-facing description of a vendor fault line.
+
+    "ERROR:24." -> "ERROR:24 — lid or drawer open — close it, then press start
+    on the machine". Unknown codes (or non-fault lines) come back verbatim.
+    """
+    code = get_error_code(line)
+    desc = VENDOR_FAULTS.get(code) if code is not None else None
+    if desc is None:
+        return line.strip()
+    return f"ERROR:{code:02d} — {desc}"
+
+
 def is_alarm(line: str) -> bool:
     """Return True if line is a GRBL alarm (ALARM:N)."""
     return line.strip().startswith("ALARM:")

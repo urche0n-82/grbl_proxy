@@ -50,6 +50,21 @@ HOLD_FAULT_POLLS = 8
 # laser that is the fire hazard this watchdog exists to catch.
 STALL_TIMEOUT_S = 5.0
 
+# Machine-initiated pauses. The Falcon firmware pauses on its own for a lid or
+# drawer opening (ERROR:24.), airflow loss (ERROR:04.) and the like, and resumes
+# when the operator presses start on the machine. That is only safe to wait out
+# when the machine *proves* it is safe: held, stationary, and reporting its
+# laser output off. If it can't prove that within this window, the fail-safe
+# soft reset applies — a frozen head with the laser on is exactly what it's for.
+MACHINE_HOLD_CONFIRM_S = 3.0
+# Faster polling while a machine hold is unconfirmed, so a report carrying the
+# Ov/A (override/accessory) fields lands well inside the confirmation window.
+HOLD_POLL_INTERVAL = 0.1
+# Status states in which the machine is stopped and holding. Hold:1 (still
+# decelerating) and Door:2/Door:3 (parking/restoring) are transitional.
+_HELD_STATES = ("Hold:0", "Door:0", "Door:1")
+_HOLD_LIKE = ("Hold", "Door")
+
 # Recent serial traffic kept in memory for post-mortem logging. Recording is a
 # deque append (no logging), so it is always on: DEBUG logging changes timing
 # enough to hide timing-dependent faults, so the evidence must not depend on it.
@@ -96,6 +111,7 @@ class GrblStreamer:
         poll_interval: float = POLL_INTERVAL,
         rx_buffer_size: int = RX_BUFFER_SIZE,
         stall_timeout_s: float = STALL_TIMEOUT_S,
+        hold_confirm_s: float = MACHINE_HOLD_CONFIRM_S,
     ) -> None:
         self._path = gcode_path
         self._serial = serial_conn
@@ -125,6 +141,15 @@ class GrblStreamer:
         self._hold_polls = 0
         self._last_mpos: tuple[float, float, float] | None = None
         self._last_progress = time.monotonic()
+        # Machine-initiated pause supervision (see _enter_machine_hold).
+        self._hold_confirm_s = hold_confirm_s
+        self._machine_hold: str | None = None
+        self._hold_started = 0.0
+        self._hold_confirmed = False
+        self._last_status_time = time.monotonic()
+        # Set when a machine hold ends, cleared by the next ok: an Idle in that
+        # window with lines still in flight means the firmware dropped them.
+        self._resumed_from_hold = False
         # Always-on post-mortem trace of serial traffic (see TRACE_LEN).
         self._trace: deque[tuple[float, str, str]] = deque(maxlen=TRACE_LEN)
 
@@ -219,6 +244,18 @@ class GrblStreamer:
     def is_paused(self) -> bool:
         return not self._resume_event.is_set()
 
+    @property
+    def machine_hold(self) -> str | None:
+        """Description of a machine-initiated pause in progress, else None."""
+        if self._machine_hold is None:
+            return None
+        return grbl_protocol.describe_vendor_fault(self._machine_hold)
+
+    @property
+    def machine_hold_confirmed(self) -> bool:
+        """True once the machine has proven the hold safe (stopped, laser off)."""
+        return self._machine_hold is not None and self._hold_confirmed
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -303,6 +340,7 @@ class GrblStreamer:
                     continue  # serial timeout tick, keep waiting
                 if grbl_protocol.is_ok(response):
                     self._last_progress = time.monotonic()
+                    self._resumed_from_hold = False
                     idle_polls = 0
                     # An ack is proof the accounting is tracking — any
                     # drained-RX streak we were building is not a phantom.
@@ -323,25 +361,11 @@ class GrblStreamer:
                     error_code = grbl_protocol.get_error_code(response)
                     if grbl_protocol.is_vendor_fault(response):
                         # A machine-level fault pushed asynchronously (e.g.
-                        # "ERROR:04." = airflow interlock, machine has stopped).
-                        # Not a rejected G-code line, and its code does not map
-                        # to GRBL's error table — report it verbatim.
-                        msg = (
-                            f"machine fault {response.strip()} after "
-                            f"{self._lines_sent} lines — the controller has "
-                            f"stopped; job halted"
-                        )
-                        logger.error("Streamer: %s", msg)
-                        return StreamerResult(
-                            completed=False,
-                            cancelled=False,
-                            error_line=None,
-                            error_code=None,
-                            alarm_code=None,
-                            lines_sent=self._lines_sent,
-                            total_lines=len(lines),
-                            message=msg,
-                        )
+                        # "ERROR:24." = lid open). Not a rejected G-code line:
+                        # the firmware has paused itself and may resume from
+                        # its own start button. Supervise rather than abort.
+                        self._enter_machine_hold(response.strip())
+                        continue
                     logger.error(
                         "GRBL error:%s on line %d (%r)",
                         error_code, i + 1, line
@@ -402,6 +426,12 @@ class GrblStreamer:
                         if status.get("state") == "Idle":
                             idle_polls += 1
                             if idle_polls >= IDLE_COMPLETE_POLLS:
+                                if self._resumed_from_hold:
+                                    return self._fault_result(
+                                        self._dropped_after_hold_msg(
+                                            len(line_lengths)
+                                        )
+                                    )
                                 logger.warning(
                                     "Streamer: GRBL Idle with %d byte(s) still "
                                     "marked in flight after %d lines — ack "
@@ -518,8 +548,11 @@ class GrblStreamer:
                 continue
             if grbl_protocol.is_ok(response):
                 self._last_progress = time.monotonic()
+                self._resumed_from_hold = False
                 line_lengths.popleft()
                 idle_polls = 0
+            elif grbl_protocol.is_vendor_fault(response):
+                self._enter_machine_hold(response.strip())
             elif grbl_protocol.is_error(response):
                 error_code = grbl_protocol.get_error_code(response)
                 logger.error(
@@ -559,6 +592,10 @@ class GrblStreamer:
                     if status.get("state") == "Idle":
                         idle_polls += 1
                         if idle_polls >= IDLE_COMPLETE_POLLS:
+                            if self._resumed_from_hold:
+                                return self._fault_result(
+                                    self._dropped_after_hold_msg(len(line_lengths))
+                                )
                             logger.warning(
                                 "Streamer: GRBL reached Idle with %d line(s) "
                                 "still unacked — treating job as complete. "
@@ -628,7 +665,10 @@ class GrblStreamer:
         tests) instead of depending on how two tasks happen to interleave.
         """
         now = time.monotonic()
-        if now - self._last_poll < self._poll_interval:
+        interval = self._poll_interval
+        if self._machine_hold is not None and not self._hold_confirmed:
+            interval = min(interval, HOLD_POLL_INTERVAL)
+        if now - self._last_poll < interval:
             return
         self._last_poll = now
         try:
@@ -669,10 +709,13 @@ class GrblStreamer:
         on the reported state is what keeps that from becoming an endless drain
         with the head parked and (under M3) the laser still firing.
 
-        Also tracks machine position for the stall watchdog.
+        Also tracks machine position for the stall watchdog, and supervises
+        machine-initiated holds (see _machine_hold_check).
         """
+        self._last_status_time = time.monotonic()
         mpos = status.get("mpos") or status.get("wpos")
-        if mpos is not None and mpos != self._last_mpos:
+        moved = mpos is not None and mpos != self._last_mpos
+        if moved:
             self._last_mpos = mpos
             self._last_progress = time.monotonic()
 
@@ -683,23 +726,114 @@ class GrblStreamer:
                 f"GRBL entered Alarm state after {self._lines_sent} lines "
                 f"(no ALARM:N line was received)"
             )
-        if state.startswith(("Hold", "Door")) and not self.is_paused:
+        if self._machine_hold is not None:
+            return self._machine_hold_check(status, state, moved)
+        if state.startswith(_HOLD_LIKE) and not self.is_paused:
             # A hold the proxy didn't ask for: a door/lid/air interlock or a
-            # firmware-initiated hold. Brief ones occur right after a resume.
+            # firmware-initiated hold. Brief ones occur right after a resume;
+            # a sustained one is supervised like a vendor-fault pause.
             self._hold_polls += 1
             if self._hold_polls >= HOLD_FAULT_POLLS:
-                return (
-                    f"GRBL held in {state} for {self._hold_polls} status polls "
-                    f"after {self._lines_sent} lines without a pause request — "
-                    f"interlock or firmware hold"
-                )
+                self._enter_machine_hold(state)
+                return self._machine_hold_check(status, state, moved)
         else:
             self._hold_polls = 0
+        return None
+
+    def _enter_machine_hold(self, reason: str) -> None:
+        """Start supervising a pause the machine initiated on its own."""
+        if self._machine_hold is not None:
+            logger.info(
+                "Streamer: %s while already in machine hold (%s)",
+                reason, self._machine_hold,
+            )
+            return
+        self._machine_hold = reason
+        self._hold_started = time.monotonic()
+        self._hold_confirmed = False
+        self._hold_polls = 0
+        logger.warning(
+            "Streamer: machine paused itself after %d lines: %s — waiting up to "
+            "%.1fs for it to report stopped with the laser off",
+            self._lines_sent, grbl_protocol.describe_vendor_fault(reason),
+            self._hold_confirm_s,
+        )
+        self._dump_trace(f"machine hold: {reason}", level=logging.INFO)
+
+    def _machine_hold_check(
+        self, status: grbl_protocol.StatusReport, state: str, moved: bool
+    ) -> str | None:
+        """Supervise an active machine hold from one status report.
+
+        The hold is only waited out once the machine proves it is safe: a held
+        state, no motion, and a report carrying the override field (Ov) without
+        an enabled spindle/laser accessory (A:S / A:C). GRBL only sends A: in
+        reports that carry Ov:, and forces one when the spindle state changes,
+        so that combination is positive evidence the laser output is off.
+        """
+        reason = self._machine_hold
+        held = state in _HELD_STATES or state in _HOLD_LIKE
+        laser_on = any(c in status.get("a", "") for c in "SC")
+        laser_off_evidence = "ov" in status and not laser_on
+
+        if not self._hold_confirmed:
+            if held and not moved and laser_off_evidence:
+                self._hold_confirmed = True
+                logger.warning(
+                    "Streamer: machine hold confirmed safe (%s, laser off) — "
+                    "waiting for the machine to resume: %s",
+                    state, grbl_protocol.describe_vendor_fault(reason),
+                )
+            return None  # the confirmation window is enforced by _stall_fault
+
+        if not state.startswith(_HOLD_LIKE) or state == "Door:3":
+            held_for = time.monotonic() - self._hold_started
+            logger.info(
+                "Streamer: machine resumed (%s) after %s — held %.1fs",
+                state, reason, held_for,
+            )
+            self._machine_hold = None
+            self._hold_confirmed = False
+            self._resumed_from_hold = True
+            self._last_progress = time.monotonic()
+            return None
+        if held and laser_on:
+            return (
+                f"machine held ({state}) after {reason} but reports its laser "
+                f"output ON (A:{status.get('a')})"
+            )
+        if held and moved:
+            return (
+                f"machine reports {state} after {reason} but the head is moving "
+                f"(MPos {self._last_mpos})"
+            )
         return None
 
     def _stall_fault(self) -> str | None:
         """Return a fault description if the job has stopped making progress."""
         now = time.monotonic()
+        if self._machine_hold is not None:
+            if not self._hold_confirmed:
+                waited = now - self._hold_started
+                if waited >= self._hold_confirm_s:
+                    return (
+                        f"machine stopped after {self._lines_sent} lines "
+                        f"({grbl_protocol.describe_vendor_fault(self._machine_hold)}) "
+                        f"but did not report a safe hold with the laser off "
+                        f"within {self._hold_confirm_s:.1f}s"
+                    )
+                return None
+            # A confirmed hold may legitimately last as long as the operator
+            # takes — but only while the machine keeps reporting. Silence means
+            # supervision is lost.
+            silent_for = now - self._last_status_time
+            if silent_for >= self._stall_timeout_s:
+                return (
+                    f"no status report for {silent_for:.1f}s during machine "
+                    f"hold ({self._machine_hold}) — supervision lost"
+                )
+            self._last_progress = now
+            return None
         if self.is_paused:
             # An operator hold is intentional — never a stall.
             self._last_progress = now
@@ -711,6 +845,13 @@ class GrblStreamer:
         return (
             f"job stalled: no ack and no machine motion for {stalled_for:.1f}s "
             f"after {self._lines_sent} lines (last position {self._last_mpos})"
+        )
+
+    def _dropped_after_hold_msg(self, in_flight: int) -> str:
+        return (
+            f"machine went Idle after resuming from a hold with {in_flight} "
+            f"queued line(s) never acknowledged — the firmware discarded them, "
+            f"so continuing would skip part of the job"
         )
 
     def _fault_result(self, message: str) -> StreamerResult:
@@ -766,7 +907,7 @@ class GrblStreamer:
                 e, reason,
             )
 
-    def _dump_trace(self, reason: str) -> None:
+    def _dump_trace(self, reason: str, level: int = logging.ERROR) -> None:
         """Log the recent serial traffic so a fault leaves evidence behind."""
         if not self._trace:
             return
@@ -775,10 +916,12 @@ class GrblStreamer:
             f"  {t - t_end:+8.3f}s {direction} {text!r}"
             for t, direction, text in self._trace
         )
-        logger.error(
-            "Streamer: last %d serial events before fault (%s) "
+        what = f"fault ({reason})" if level >= logging.ERROR else reason
+        logger.log(
+            level,
+            "Streamer: last %d serial events before %s "
             "[> sent, < received]:\n%s",
-            len(self._trace), reason, body,
+            len(self._trace), what, body,
         )
 
     def _buffer_looks_phantom(

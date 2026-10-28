@@ -41,6 +41,12 @@ class StatusSnapshot:
     # keeps reporting <Idle> through such a fault, so this is the only signal
     # that the first job of a session may silently stall.
     last_machine_fault: str | None = None
+    # A pause the machine initiated itself mid-job (lid/drawer open, airflow
+    # loss, ...), described for the operator. Confirmed once the machine has
+    # reported it stopped with the laser off; until then the streamer may still
+    # fail-safe the job.
+    machine_hold: str | None = None
+    machine_hold_confirmed: bool = False
 
 
 class ProxyStatus:
@@ -78,7 +84,16 @@ class ProxyStatus:
         lines_sent: int | None = None
         total_lines: int | None = None
         progress_pct: float | None = None
+        machine_hold: str | None = None
+        machine_hold_confirmed = False
         if streamer is not None:
+            # Coerced like last_machine_fault: this is JSON-serialised.
+            hold = getattr(streamer, "machine_hold", None)
+            if isinstance(hold, str):
+                machine_hold = hold
+                machine_hold_confirmed = (
+                    getattr(streamer, "machine_hold_confirmed", False) is True
+                )
             lines_sent = streamer._lines_sent
             total_lines = streamer._total_lines
             if total_lines and total_lines > 0:
@@ -113,6 +128,8 @@ class ProxyStatus:
                 fault if isinstance(fault := getattr(core, "_last_machine_fault", None), str)
                 else None
             ),
+            machine_hold=machine_hold,
+            machine_hold_confirmed=machine_hold_confirmed,
             timestamp=time.monotonic(),
         )
 

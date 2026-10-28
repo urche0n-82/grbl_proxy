@@ -433,13 +433,19 @@ class TestStreamerUnit:
         physically stops the machine while it still reports <Idle>. A
         case-sensitive "error:" test missed it entirely and the streamer kept
         feeding G-code to a controller that had stopped working.
+
+        The fault starts a supervised machine hold; a machine that never proves
+        it stopped safely (here: no status at all) is halted when it expires.
         """
         gcode = tmp_path / "test.gcode"
         lines = [f"G1 X{i}Y{i}" for i in range(20)]
         _write_gcode_file(gcode, lines)
         mock = MockSerialConnection(auto_respond=False)
         results = []
-        streamer = GrblStreamer(gcode, mock, on_done=results.append, rx_buffer_size=16)
+        streamer = GrblStreamer(
+            gcode, mock, on_done=results.append, rx_buffer_size=16,
+            hold_confirm_s=0.3,
+        )
 
         async def feed():
             await asyncio.sleep(0.05)
@@ -447,19 +453,21 @@ class TestStreamerUnit:
             # The multi-line help text that follows must not confuse anything.
             mock.inject("    No airflow is detected and the machine has stopped working.")
 
-        with caplog.at_level(logging.ERROR, logger="grbl_proxy.streamer"):
+        with caplog.at_level(logging.WARNING, logger="grbl_proxy.streamer"):
             task = asyncio.create_task(streamer.run())
             await feed()
-            await asyncio.wait_for(task, timeout=3.0)
+            await asyncio.wait_for(task, timeout=4.0)
 
         r = results[0]
         assert not r.completed
         assert r.lines_sent < len(lines)          # stopped, did not keep feeding
-        assert r.message and "ERROR:04." in r.message
+        assert r.message and "ERROR:04" in r.message
+        assert "no airflow" in r.message          # described from the vendor table
         # Reported as a machine fault, not mapped onto GRBL's error table
         # (where 4 means something unrelated).
         assert r.error_code is None
-        assert "machine fault" in caplog.text.lower()
+        assert "machine paused itself" in caplog.text
+        assert _soft_reset_sent(mock)
 
     async def test_vendor_boot_chatter_is_not_corruption(self, tmp_path, caplog):
         """The controller's boot lines use "[OK]" as a *prefix* rather than a
@@ -1441,20 +1449,23 @@ class TestFaultSafety:
         assert _soft_reset_sent(mock), "fail-safe 0x18 was not sent"
         assert "FAIL-SAFE soft reset" in caplog.text
 
-    async def test_unrequested_hold_is_a_fault(self, tmp_path):
+    async def test_unrequested_hold_without_laser_off_evidence_is_a_fault(self, tmp_path):
+        """A hold the proxy didn't ask for is supervised; with no report that
+        the laser is off (no Ov field) it can't be proven safe → fail-safe."""
         gcode = tmp_path / "job.gcode"
         _write_gcode_file(gcode, ["M3 S1000", "G1 X10 F600"])
         mock = MockSerialConnection(auto_respond=False)
         results = []
-        streamer = GrblStreamer(gcode, mock, on_done=results.append)
+        streamer = GrblStreamer(gcode, mock, on_done=results.append, hold_confirm_s=0.3)
 
         task = asyncio.create_task(streamer.run())
         await asyncio.sleep(0.05)
         for _ in range(HOLD_FAULT_POLLS):
             mock.inject("<Hold:0|MPos:1.000,1.000,0.000|FS:0,0>")
-        await asyncio.wait_for(task, timeout=3.0)
+        await asyncio.wait_for(task, timeout=4.0)
 
         assert "Hold:0" in results[0].message
+        assert "laser off" in results[0].message
         assert _soft_reset_sent(mock)
 
     def test_hold_during_operator_pause_is_not_a_fault(self, tmp_path):
@@ -1582,6 +1593,199 @@ class TestFaultSafety:
         assert "serial events before fault" in caplog.text
         assert "G1 X10 F600" in caplog.text      # what we sent
         assert "Alarm|MPos" in caplog.text       # what GRBL said
+
+
+# ---------------------------------------------------------------------------
+# Machine-initiated pauses: the Falcon pauses itself for a lid/drawer opening
+# (ERROR:24.), airflow loss (ERROR:04.) etc. and resumes from its own start
+# button. The streamer waits that out ONLY once the machine proves it is safe —
+# held, stationary, and reporting its laser output off (Ov present, no A:S/A:C).
+# ---------------------------------------------------------------------------
+
+_HELD_LASER_OFF = "<Hold:0|MPos:5.000,5.000,0.000|FS:0,0|Ov:100,100,100>"
+_HELD_LASER_ON = "<Hold:0|MPos:5.000,5.000,0.000|FS:0,1000|Ov:100,100,100|A:S>"
+
+
+def _hold_streamer(tmp_path, mock, results, lines=("M3 S1000", "G1 X10 F600", "G1 X20")):
+    gcode = tmp_path / "job.gcode"
+    _write_gcode_file(gcode, list(lines))
+    return GrblStreamer(
+        gcode, mock, on_done=results.append,
+        stall_timeout_s=0.3, hold_confirm_s=0.3,
+    )
+
+
+class TestMachineHold:
+    async def test_lid_open_pause_waits_and_resumes(self, tmp_path, caplog):
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        # Held long past both the confirm window and the stall timeout, with
+        # the machine reporting steadily.
+        for _ in range(10):
+            mock.inject(_HELD_LASER_OFF)
+            await asyncio.sleep(0.1)
+        assert results == [], "a safe machine hold was aborted"
+        assert streamer.machine_hold_confirmed
+        assert "lid or drawer open" in streamer.machine_hold
+
+        # Operator closes the lid and presses start on the machine.
+        mock.inject("<Run|MPos:6.000,5.000,0.000|FS:600,1000>")
+        for _ in range(3):
+            mock.inject("ok")
+        with caplog.at_level(logging.INFO, logger="grbl_proxy.streamer"):
+            await asyncio.wait_for(task, timeout=3.0)
+
+        assert results[0].completed
+        assert not _soft_reset_sent(mock)
+        assert streamer.machine_hold is None
+
+    async def test_hold_with_laser_on_is_a_fault(self, tmp_path):
+        """The original hazard: the machine stops but the laser stays on."""
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        for _ in range(6):
+            mock.inject(_HELD_LASER_ON)
+            await asyncio.sleep(0.1)
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert not results[0].completed
+        assert _soft_reset_sent(mock)
+
+    async def test_laser_turning_on_during_confirmed_hold_is_a_fault(self, tmp_path):
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        mock.inject(_HELD_LASER_OFF)
+        mock.inject(_HELD_LASER_OFF)
+        await asyncio.sleep(0.1)
+        assert streamer.machine_hold_confirmed
+        mock.inject(_HELD_LASER_ON)
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert "laser output ON" in results[0].message
+        assert _soft_reset_sent(mock)
+
+    async def test_vendor_fault_but_machine_still_running_is_a_fault(self, tmp_path):
+        """Fault reported, but the machine claims Run with a frozen head — not
+        a controlled pause."""
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        for _ in range(6):
+            mock.inject(_RUN_FROZEN)
+            await asyncio.sleep(0.1)
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert "did not report a safe hold" in results[0].message
+        assert _soft_reset_sent(mock)
+
+    async def test_status_silence_during_confirmed_hold_is_a_fault(self, tmp_path):
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        mock.inject(_HELD_LASER_OFF)
+        mock.inject(_HELD_LASER_OFF)
+        await asyncio.wait_for(task, timeout=4.0)  # then nothing at all
+
+        assert "supervision lost" in results[0].message
+        assert _soft_reset_sent(mock)
+
+    async def test_resume_to_idle_with_lines_in_flight_is_a_fault(self, tmp_path):
+        """If the firmware flushed its queue during the pause, Idle-reconcile
+        would silently skip those lines. That must stop the job instead."""
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        mock.inject(_HELD_LASER_OFF)
+        mock.inject(_HELD_LASER_OFF)
+        await asyncio.sleep(0.1)
+        for _ in range(IDLE_COMPLETE_POLLS):
+            mock.inject("<Idle|MPos:5.000,5.000,0.000|FS:0,0>")
+        await asyncio.wait_for(task, timeout=3.0)
+
+        assert not results[0].completed
+        assert "discarded" in results[0].message
+
+    async def test_unrequested_door_with_laser_off_waits_and_resumes(self, tmp_path):
+        """No vendor line at all — a plain GRBL door hold is supervised too."""
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+        # Keep the production ordering: the unrequested-hold debounce
+        # (HOLD_FAULT_POLLS) must elapse well inside the stall timeout.
+        streamer._stall_timeout_s = 2.0
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        for _ in range(HOLD_FAULT_POLLS + 6):
+            mock.inject("<Door:1|MPos:5.000,5.000,0.000|FS:0,0|Ov:100,100,100>")
+            await asyncio.sleep(0.05)
+        assert results == []
+        assert streamer.machine_hold_confirmed
+
+        mock.inject("<Run|MPos:6.000,5.000,0.000|FS:600,1000>")
+        for _ in range(3):
+            mock.inject("ok")
+        await asyncio.wait_for(task, timeout=3.0)
+        assert results[0].completed
+        assert not _soft_reset_sent(mock)
+
+    async def test_alarm_during_hold_still_resets(self, tmp_path):
+        mock = MockSerialConnection(auto_respond=False)
+        results = []
+        streamer = _hold_streamer(tmp_path, mock, results)
+
+        task = asyncio.create_task(streamer.run())
+        await asyncio.sleep(0.05)
+        mock.inject("ERROR:24.")
+        mock.inject(_HELD_LASER_OFF)
+        mock.inject(_HELD_LASER_OFF)
+        mock.inject(_ALARM_STATUS)
+        await asyncio.wait_for(task, timeout=3.0)
+        assert "Alarm" in results[0].message
+        assert _soft_reset_sent(mock)
+
+
+class TestVendorFaultDescriptions:
+    def test_known_code(self):
+        d = grbl_protocol.describe_vendor_fault("ERROR:24.")
+        assert d.startswith("ERROR:24")
+        assert "lid or drawer open" in d
+
+    def test_flame(self):
+        assert "FLAME" in grbl_protocol.describe_vendor_fault("ERROR:05.")
+
+    def test_unknown_code_is_verbatim(self):
+        assert grbl_protocol.describe_vendor_fault("ERROR:99.") == "ERROR:99."
+
+    def test_non_fault_is_verbatim(self):
+        assert grbl_protocol.describe_vendor_fault("Hold:0") == "Hold:0"
 
 
 class TestFaultTokenRecovery:
